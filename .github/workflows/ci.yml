@@ -41,6 +41,11 @@ jobs:
           code=$?
           head -40 out.txt | tee -a "$GITHUB_STEP_SUMMARY"
           if [ "$code" -ne 1 ]; then echo "expected the checker to find stale reads (exit 1), got $code" >&2; exit 1; fi
+      - name: keep histories and logs, not databases
+        if: always()
+        run: |
+          sudo rm -rf store/*/*/n*/data
+          sudo chown -R "$(id -u):$(id -g)" store
       - if: always()
         uses: actions/upload-artifact@v4
         with:
