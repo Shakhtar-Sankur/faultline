@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  ETCD: v3.5.17
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --release --all-targets -- -D warnings
+      - run: cargo test --release
+
+  etcd:
+    name: etcd under partitions, crashes and pauses
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - run: curl -sSfL https://github.com/etcd-io/etcd/releases/download/$ETCD/etcd-$ETCD-linux-amd64.tar.gz | tar xz
+      - name: linearizable etcd must pass
+        run: |
+          sudo ./target/release/faultline test etcd --etcd etcd-$ETCD-linux-amd64/etcd \
+            --time 90 --faults partition,kill,pause --fault-gap 3 --fault-for 6 | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: stale serializable reads must be caught
+        run: |
+          set +e
+          sudo ./target/release/faultline test etcd --etcd etcd-$ETCD-linux-amd64/etcd \
+            --time 60 --faults partition --fault-gap 3 --fault-for 6 --serializable-reads > out.txt
+          code=$?
+          head -40 out.txt | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "$code" -ne 1 ]; then echo "expected the checker to find stale reads (exit 1), got $code" >&2; exit 1; fi
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: store
+          path: store

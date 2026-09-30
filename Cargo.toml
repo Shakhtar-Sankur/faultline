@@ -1,0 +1,12 @@
+[package]
+name = "faultline"
+version = "0.1.0"
+edition = "2024"
+description = "Jepsen-style fault injection for real databases: partitions, crashes and pauses, with histories checked for linearizability and lost writes"
+license = "Apache-2.0"
+repository = "https://github.com/Shakhtar-Sankur/faultline"
+
+[dependencies]
+
+[profile.release]
+debug = false
