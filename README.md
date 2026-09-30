@@ -135,8 +135,8 @@ fence, not the lock, keeps the data safe.
 ### The same hazard with no client stall at all
 
 A client that never stalls is not safe either. Across the version campaign
-below, with only faults on the etcd **servers** (no simulated client
-pauses), naive locking lost updates in **4 of 18 runs**, on every release
+below and its follow-up runs, with only faults on the etcd **servers** (no
+simulated client pauses), naive locking lost updates in **4 of 18 runs**, on every release
 line tested:
 
 | etcd | Lost updates (naive lock, server faults only) |
@@ -290,7 +290,7 @@ with no arguments lists them.
 - Black-box testing finds what its faults happen to provoke. etcd's own
   robustness suite injects faults inside the process (failpoints) and runs
   under Antithesis' deterministic hypervisor, reaching timing windows that
-  signals and iptables rarely hit (see below).
+  signals and iptables rarely hit (see "A known bug it did not find").
 - Every node shares one machine, so timing differs from a real
   multi-machine deployment; it finds ordering bugs, not performance ones.
 
