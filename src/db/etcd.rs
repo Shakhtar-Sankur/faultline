@@ -75,6 +75,42 @@ impl Database for Etcd {
         .is_ok_and(|r| r.status == 200)
     }
 
+    fn leader(&self, cluster: &Cluster) -> Option<usize> {
+        // Each node reports its own member id and the leader's; the leader
+        // is the node whose two ids agree. Asking every node survives the
+        // leader itself being unreachable.
+        let mut leader_id = None;
+        let mut ids = Vec::new();
+        for (i, n) in cluster.nodes.iter().enumerate() {
+            let addr = SocketAddr::new(n.ip.into(), CLIENT_PORT);
+            let Ok(r) = http::post(
+                addr,
+                "/v3/maintenance/status",
+                "{}",
+                Duration::from_millis(300),
+            ) else {
+                continue;
+            };
+            let Ok(j) = json::parse(&r.body) else {
+                continue;
+            };
+            let member = j
+                .get("header")
+                .and_then(|h| h.get("member_id"))
+                .and_then(Json::as_str);
+            if let Some(m) = member {
+                ids.push((i, m.to_string()));
+            }
+            if let Some(l) = j.get("leader").and_then(Json::as_str).filter(|l| *l != "0") {
+                leader_id = Some(l.to_string());
+            }
+        }
+        let leader_id = leader_id?;
+        ids.into_iter()
+            .find(|(_, m)| *m == leader_id)
+            .map(|(i, _)| i)
+    }
+
     fn client(&self, cluster: &Cluster, node: usize, timeout: Duration) -> Box<dyn Client> {
         Box::new(EtcdClient {
             addr: SocketAddr::new(cluster.nodes[node].ip.into(), CLIENT_PORT),

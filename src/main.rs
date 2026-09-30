@@ -3,7 +3,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use faultline::db::etcd::Etcd;
-use faultline::test::{self, Config, Fault};
+use faultline::test::{self, Config, Fault, Target};
 
 const USAGE: &str = "\
 usage:
@@ -17,6 +17,7 @@ options:
   --faults LIST         any of partition,kill,pause, or none (default partition,kill,pause)
   --fault-gap S         quiet seconds before each fault (default 5)
   --fault-for S         seconds each fault lasts (default 5)
+  --target T            random, or leader: fault the current leader (default random)
   --ops-per-key N       operations on a key before moving on (default 150)
   --timeout-ms N        client timeout (default 1000)
   --seed N              seed for the operation and fault schedule (default: time)
@@ -61,6 +62,7 @@ fn run_etcd(args: &[String]) -> Result<ExitCode, String> {
         faults: vec![Fault::Partition, Fault::Kill, Fault::Pause],
         fault_gap: Duration::from_secs(5),
         fault_for: Duration::from_secs(5),
+        target: Target::Random,
         ops_per_key: 150,
         timeout: Duration::from_millis(1000),
         op_delay: Duration::from_millis(10),
@@ -94,6 +96,13 @@ fn run_etcd(args: &[String]) -> Result<ExitCode, String> {
             "--ops-per-key" => cfg.ops_per_key = num()?.max(1),
             "--timeout-ms" => cfg.timeout = Duration::from_millis(num()?),
             "--seed" => cfg.seed = num()?,
+            "--target" => {
+                cfg.target = match value.as_str() {
+                    "random" => Target::Random,
+                    "leader" => Target::Leader,
+                    other => return Err(format!("unknown target {other}")),
+                }
+            }
             "--store" => cfg.store = PathBuf::from(value),
             "--faults" if value == "none" => cfg.faults.clear(),
             "--faults" => {

@@ -91,7 +91,9 @@ CI runs both directions on every push, against a real etcd release.
   partitions are real dropped packets between real addresses, not a
   simulation. Clients run in the host namespace and reach every node.
 - **Faults.** A partition splits the nodes into a majority and a minority,
-  or cuts one node off, with iptables rules inside the namespaces. A crash
+  or cuts one node off, with iptables rules inside the namespaces.
+  `--target leader` aims every fault at whichever node leads right now
+  (found from each node's status), and follows leadership as it moves. A crash
   is `SIGKILL` and a restart from the node's data directory. A pause is
   `SIGSTOP`/`SIGCONT`, like a long GC pause or a stalled VM. The schedule
   is seeded, so a run can be repeated.

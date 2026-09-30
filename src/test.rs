@@ -24,6 +24,15 @@ pub enum Fault {
     Pause,
 }
 
+/// Which node a fault picks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Target {
+    Random,
+    /// The current leader (random when none can be found), and for a
+    /// partition, the leader alone against everyone else.
+    Leader,
+}
+
 impl Fault {
     pub fn parse(s: &str) -> Option<Fault> {
         match s {
@@ -44,6 +53,7 @@ pub struct Config {
     /// Quiet time before each fault, and how long each fault lasts.
     pub fault_gap: Duration,
     pub fault_for: Duration,
+    pub target: Target,
     /// Operations on one key before clients move to the next, which keeps
     /// each key's history small enough to check exhaustively.
     pub ops_per_key: u64,
@@ -222,22 +232,37 @@ fn nemesis(
             .push((t0.elapsed().as_nanos() as u64, what))
     };
     let n = cluster.nodes.len();
-    let name = |i: usize| cluster.nodes[i].name.clone();
     loop {
         if Instant::now() + cfg.fault_gap + cfg.fault_for >= deadline {
             return;
         }
         std::thread::sleep(cfg.fault_gap);
         let fault = cfg.faults[rng.below(cfg.faults.len() as u64) as usize];
-        let victim = rng.below(n as u64) as usize;
+        let random = rng.below(n as u64) as usize;
+        let leader = match cfg.target {
+            Target::Leader => db.leader(cluster),
+            Target::Random => None,
+        };
+        let victim = leader.unwrap_or(random);
+        let name = |i: usize| {
+            if Some(i) == leader {
+                format!("{} (leader)", cluster.nodes[i].name)
+            } else {
+                cluster.nodes[i].name.clone()
+            }
+        };
         let result = match fault {
             Fault::Partition => {
                 let mut order: Vec<usize> = (0..n).collect();
                 rng.shuffle(&mut order);
                 // Half the time a majority and a minority, half the time
-                // one node cut off from everyone.
+                // one node cut off from everyone; with a leader target, the
+                // leader cut off from everyone.
                 let cut = if rng.below(2) == 0 { n / 2 } else { 1 };
-                let sides = vec![order[..cut].to_vec(), order[cut..].to_vec()];
+                let sides = match leader {
+                    Some(l) => vec![vec![l], (0..n).filter(|&i| i != l).collect()],
+                    None => vec![order[..cut].to_vec(), order[cut..].to_vec()],
+                };
                 let show =
                     |v: &Vec<usize>| v.iter().map(|&i| name(i)).collect::<Vec<_>>().join(" ");
                 note(format!(
@@ -256,7 +281,7 @@ fn nemesis(
                 note(format!("kill -9 {}", name(victim)));
                 cluster.kill(victim).and_then(|_| {
                     std::thread::sleep(cfg.fault_for);
-                    note(format!("restart {}", name(victim)));
+                    note(format!("restart {}", cluster.nodes[victim].name));
                     db.start(cluster, victim)
                 })
             }
@@ -264,7 +289,7 @@ fn nemesis(
                 note(format!("pause {} (SIGSTOP)", name(victim)));
                 cluster.pause(victim).and_then(|_| {
                     std::thread::sleep(cfg.fault_for);
-                    note(format!("resume {} (SIGCONT)", name(victim)));
+                    note(format!("resume {} (SIGCONT)", cluster.nodes[victim].name));
                     cluster.resume(victim)
                 })
             }

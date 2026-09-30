@@ -35,6 +35,11 @@ pub trait Database: Send + Sync {
         Ok(())
     }
     fn client(&self, cluster: &Cluster, node: usize, timeout: Duration) -> Box<dyn Client>;
+    /// The node that currently leads, if the database has one and some
+    /// node can say which.
+    fn leader(&self, _cluster: &Cluster) -> Option<usize> {
+        None
+    }
 }
 
 /// Start every node and wait until all are ready.

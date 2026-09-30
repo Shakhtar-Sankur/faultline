@@ -12,12 +12,13 @@ pub fn summary(r: &Report, db: &dyn Database, cfg: &Config) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "{} on {} nodes, {} clients, {}s, faults {:?}, seed {}",
+        "{} on {} nodes, {} clients, {}s, faults {:?} on {:?} nodes, seed {}",
         db.name(),
         cfg.nodes,
         cfg.clients,
         cfg.time.as_secs(),
         cfg.faults,
+        cfg.target,
         cfg.seed
     );
     let _ = writeln!(
