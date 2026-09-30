@@ -116,7 +116,6 @@ updates**: acknowledged increments that read the same value.
 | Naive lock, no faults, 30 s | 0 | 0 | 0 | valid |
 | Naive lock, 5% of holders stall past their lease, 40 s | 266 | 0 | **121** | **invalid** |
 | Fenced writes (etcd's recommendation), same stalls, 40 s | 251 | 18 (one per stall) | 0 | valid |
-| Naive lock, partitions, crashes and pauses of etcd nodes, no stalls, 120 s | 0 | 0 | 0 | valid |
 
 ```
 $ sudo faultline test etcd --etcd ./etcd --workload lock --stall-percent 5 --time 40
@@ -131,9 +130,43 @@ A stalled holder wakes up and writes a value it read seconds earlier,
 dragging the counter back, so one stall costs many updates. With fenced
 writes each stalled holder's write is refused instead (18 stalls, 18
 refusals) and nothing is lost, though the lock itself still overlaps: the
-fence, not the lock, keeps the data safe. Faults on the etcd servers alone,
-with short critical sections, did not break the lock in 120 seconds; the
-hazard needs the holder itself to outlive its lease.
+fence, not the lock, keeps the data safe.
+
+### The same hazard with no client stall at all
+
+A client that never stalls is not safe either. Across the version campaign
+below, with only faults on the etcd **servers** (no simulated client
+pauses), naive locking lost updates in **4 of 18 runs**, on every release
+line tested:
+
+| etcd | Lost updates (naive lock, server faults only) |
+|---|---|
+| 3.4.45 | 236 in one of 2 runs |
+| 3.5.34 | 287 in one of 3 runs |
+| 3.6.15 | 167 in one of 5 runs |
+| 3.7.2 | 229 in one of 8 runs |
+
+and fenced writes lost **nothing in 7 of 7** runs. The saved history of the
+3.6.15 run shows how, to the millisecond:
+
+1. At 3.0 s a client on n2, holding the lock, read the counter (234) and
+   wrote 235. The leader, n3, had just been paused (`SIGSTOP` at 3.002 s),
+   so the write hung, the client's request timed out (unknown outcome), and
+   the lock passed on.
+2. Other clients took the lock through the new leader and incremented the
+   counter to **339** by 8.987 s.
+3. n3 resumed at 9.003 s. At 9.049 s the next holder read **235**: the
+   six-second-old write had been applied after all, rolling the counter
+   back by 104 increments.
+
+No client held the lock at the same time as another (the checker saw no
+overlap), and etcd broke none of its guarantees: a write whose outcome is
+unknown may take effect later, which is exactly how the linearizability
+checker treats it. The lesson is the one etcd's documentation gives, now
+with a mechanism measured on a real cluster: a lock does not make a write
+safe; making the write conditional on still owning the lock does. A fenced
+write that arrives late fails its ownership check inside etcd, so the stale
+value never lands.
 
 ## Watches: the stream Kubernetes is built on
 
@@ -171,6 +204,40 @@ $ sudo faultline test etcd --etcd ./etcd --workload watch --watch-resume 2 --tim
   INVALID: 1 watch violations
     watcher 0 (n1) missed 1 revisions, first [7190]
 ```
+
+## Across etcd releases
+
+The newest release of every supported line, each run for 90 seconds under
+partitions, crashes and pauses (random nodes, and separately the current
+leader), two seeds per test:
+
+| etcd | Register ops (keys), all linearizable | Watched writes, events delivered, reconnections | Lock acquisitions (lost updates, naive) |
+|---|---|---|---|
+| 3.4.45 | 186,567 (1,246) | 86,615 · 260,103 · 120 | 7,087 (236) |
+| 3.5.34 | 217,425 (1,450) | 105,000 · 315,387 · 119 | 8,501 (287) |
+| 3.6.15 | 215,515 (1,439) | 102,263 · 307,173 · 119 | 8,421 (0) |
+| 3.7.2 | 208,688 (1,393) | 103,181 · 309,948 · 119 | 8,331 (0) |
+
+In all, **1,257,594 operations under 288 injected faults**. Every register
+history was linearizable and every watcher saw every revision exactly once,
+in order, on every version. The lost updates are the lock hazard described
+above (the follow-up runs in that section found it on 3.6.15 and 3.7.2 as
+well), not a violation of etcd's guarantees.
+
+### A known bug it did not find
+
+etcd's own robustness suite lists [#20418](https://github.com/etcd-io/etcd/issues/20418),
+*stale reads caused by process pausing*, found by Antithesis and fixed in
+3.6.9 (and 3.5.28): a node that stalls while it is confirming a read with
+the leader could later accept an out-of-date confirmation. faultline ran
+the last affected release, 3.6.8, under leader and random pauses, eight
+runs in all (six of 120 s with 4-second pauses, two of 150 s with 1-second
+pauses), and every history was linearizable, the same as on the fixed
+3.6.9. The bug needs a stall inside a narrow window of the read path;
+etcd reproduces it with failpoints and Antithesis' deterministic
+hypervisor, which aim faults inside the process. A black-box tester that
+pauses whole processes on a timer did not hit it, and this README says so
+rather than leaving it out.
 
 ## How it works
 
@@ -220,6 +287,10 @@ with no arguments lists them.
   skew, disk faults and membership changes are not yet modeled.
 - Workloads are a single-key register, a lease-based lock and watches.
   Multi-key transactions are not yet checked.
+- Black-box testing finds what its faults happen to provoke. etcd's own
+  robustness suite injects faults inside the process (failpoints) and runs
+  under Antithesis' deterministic hypervisor, reaching timing windows that
+  signals and iptables rarely hit (see below).
 - Every node shares one machine, so timing differs from a real
   multi-machine deployment; it finds ordering bugs, not performance ones.
 
