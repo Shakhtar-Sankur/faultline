@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::{Client, Database, Error};
+use super::{Client, Database, Error, LockClient};
 use crate::cluster::Cluster;
 use crate::history::Call;
 use crate::http::{self, HttpError};
@@ -111,6 +111,19 @@ impl Database for Etcd {
             .map(|(i, _)| i)
     }
 
+    fn lock_client(
+        &self,
+        cluster: &Cluster,
+        node: usize,
+        timeout: Duration,
+    ) -> Option<Box<dyn LockClient>> {
+        Some(Box::new(EtcdClient {
+            addr: SocketAddr::new(cluster.nodes[node].ip.into(), CLIENT_PORT),
+            timeout,
+            serializable_reads: false,
+        }))
+    }
+
     fn client(&self, cluster: &Cluster, node: usize, timeout: Duration) -> Box<dyn Client> {
         Box::new(EtcdClient {
             addr: SocketAddr::new(cluster.nodes[node].ip.into(), CLIENT_PORT),
@@ -213,5 +226,104 @@ impl Client for EtcdClient {
                 Err(Error::Fail("etcd tests use the register workload".into()))
             }
         }
+    }
+}
+
+const LOCK_NAME: &str = "faultline-lock";
+const COUNTER: &str = "faultline-counter";
+
+fn str_field<'a>(j: &'a Json, key: &str) -> Option<&'a str> {
+    j.get(key).and_then(Json::as_str)
+}
+
+/// etcd's lock service (the gateway to its `concurrency.Mutex`): the lock
+/// is held by whoever owns the oldest key under the lock's name, and each
+/// key is attached to its owner's lease, so it vanishes when the lease
+/// expires, whether or not its owner has noticed.
+impl LockClient for EtcdClient {
+    fn grant(&mut self, ttl: u64) -> Result<String, Error> {
+        let r = self.request("/v3/lease/grant", &format!(r#"{{"TTL":"{ttl}"}}"#), false)?;
+        str_field(&r, "ID")
+            .map(String::from)
+            .ok_or_else(|| Error::Unknown("grant: no lease ID".into()))
+    }
+
+    fn keep_alive(&mut self, lease: &str) -> Result<(), Error> {
+        let r = self.request(
+            "/v3/lease/keepalive",
+            &format!(r#"{{"ID":"{lease}"}}"#),
+            true,
+        )?;
+        let ttl = r
+            .get("result")
+            .and_then(|x| str_field(x, "TTL"))
+            .unwrap_or("0");
+        if ttl == "0" {
+            return Err(Error::Fail("lease expired".into()));
+        }
+        Ok(())
+    }
+
+    fn acquire(&mut self, lease: &str, wait: Duration) -> Result<String, Error> {
+        let saved = self.timeout;
+        self.timeout = wait;
+        let body = format!(
+            r#"{{"name":"{}","lease":"{lease}"}}"#,
+            json::base64(LOCK_NAME.as_bytes())
+        );
+        let r = self.request("/v3/lock/lock", &body, false);
+        self.timeout = saved;
+        str_field(&r?, "key")
+            .map(String::from)
+            .ok_or_else(|| Error::Unknown("lock: no key".into()))
+    }
+
+    fn read_counter(&mut self) -> Result<u64, Error> {
+        let body = format!(r#"{{"key":"{}"}}"#, json::base64(COUNTER.as_bytes()));
+        let r = self.request("/v3/kv/range", &body, true)?;
+        Ok(r.get("kvs")
+            .and_then(|kvs| kvs.as_arr().first())
+            .and_then(|kv| str_field(kv, "value"))
+            .and_then(json::unbase64)
+            .and_then(|b| String::from_utf8(b).ok())
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0))
+    }
+
+    fn write_counter(&mut self, value: u64, fence: Option<&str>) -> Result<(), Error> {
+        let (k, v) = (json::base64(COUNTER.as_bytes()), val_b64(value));
+        let Some(owner) = fence else {
+            self.request(
+                "/v3/kv/put",
+                &format!(r#"{{"key":"{k}","value":"{v}"}}"#),
+                false,
+            )?;
+            return Ok(());
+        };
+        // Put only if our ownership key still exists: etcd's documented way
+        // to act safely under a lock.
+        let body = format!(
+            r#"{{"compare":[{{"key":"{owner}","target":"CREATE","result":"GREATER","create_revision":"0"}}],"success":[{{"requestPut":{{"key":"{k}","value":"{v}"}}}}]}}"#
+        );
+        let r = self.request("/v3/kv/txn", &body, false)?;
+        if r.get("succeeded").and_then(Json::as_bool) == Some(true) {
+            Ok(())
+        } else {
+            Err(Error::Fail("fenced out: the lock was lost".into()))
+        }
+    }
+
+    fn release(&mut self, owner_key: &str) -> Result<(), Error> {
+        self.request(
+            "/v3/lock/unlock",
+            &format!(r#"{{"key":"{owner_key}"}}"#),
+            false,
+        )
+        .map(|_| ())
+    }
+
+    fn revoke(&mut self, lease: &str) -> Result<(), Error> {
+        self.request("/v3/lease/revoke", &format!(r#"{{"ID":"{lease}"}}"#), false)
+            .map(|_| ())
     }
 }

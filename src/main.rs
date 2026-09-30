@@ -3,7 +3,7 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use faultline::db::etcd::Etcd;
-use faultline::test::{self, Config, Fault, Target};
+use faultline::test::{self, Config, Fault, Target, Workload};
 
 const USAGE: &str = "\
 usage:
@@ -23,6 +23,10 @@ options:
   --seed N              seed for the operation and fault schedule (default: time)
   --store DIR           where results go (default ./store)
   --serializable-reads  etcd: read without consulting a quorum (may be stale)
+  --workload W          register (linearizability) or lock (mutual exclusion
+                        and lost updates) (default register)
+  --fenced              lock: write only while still owning the lock
+  --stall-percent N     lock: stall N% of lock holders past their lease (default 0)
 
 Needs root: nodes run in network namespaces, faults use iptables.
 Exit status: 0 valid, 1 invalid, 2 undecided, 3 error.";
@@ -63,6 +67,7 @@ fn run_etcd(args: &[String]) -> Result<ExitCode, String> {
         fault_gap: Duration::from_secs(5),
         fault_for: Duration::from_secs(5),
         target: Target::Random,
+        workload: Workload::Register,
         ops_per_key: 150,
         timeout: Duration::from_millis(1000),
         op_delay: Duration::from_millis(10),
@@ -70,11 +75,16 @@ fn run_etcd(args: &[String]) -> Result<ExitCode, String> {
         store: PathBuf::from("store"),
     };
     let (mut binary, mut serializable_reads) = (None, false);
+    let (mut lock, mut fenced, mut stall_percent) = (false, false, 0);
     let mut i = 0;
     while i < args.len() {
         let flag = args[i].as_str();
-        if flag == "--serializable-reads" {
-            serializable_reads = true;
+        if flag == "--serializable-reads" || flag == "--fenced" {
+            if flag == "--fenced" {
+                fenced = true;
+            } else {
+                serializable_reads = true;
+            }
             i += 1;
             continue;
         }
@@ -96,6 +106,14 @@ fn run_etcd(args: &[String]) -> Result<ExitCode, String> {
             "--ops-per-key" => cfg.ops_per_key = num()?.max(1),
             "--timeout-ms" => cfg.timeout = Duration::from_millis(num()?),
             "--seed" => cfg.seed = num()?,
+            "--stall-percent" => stall_percent = num()?.min(100),
+            "--workload" => {
+                lock = match value.as_str() {
+                    "register" => false,
+                    "lock" => true,
+                    other => return Err(format!("unknown workload {other}")),
+                }
+            }
             "--target" => {
                 cfg.target = match value.as_str() {
                     "random" => Target::Random,
@@ -116,6 +134,12 @@ fn run_etcd(args: &[String]) -> Result<ExitCode, String> {
         i += 2;
     }
     let binary = binary.ok_or_else(|| format!("--etcd PATH is required\n{USAGE}"))?;
+    if lock {
+        cfg.workload = Workload::Lock {
+            fenced,
+            stall_percent,
+        };
+    }
     let db = Etcd {
         binary,
         serializable_reads,

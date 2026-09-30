@@ -24,6 +24,23 @@ pub trait Client: Send {
     fn invoke(&mut self, key: u64, call: &Call) -> Result<Call, Error>;
 }
 
+/// A lease-based distributed lock, and a counter it is meant to protect.
+pub trait LockClient: Send {
+    /// A lease that expires `ttl` seconds after its last renewal.
+    fn grant(&mut self, ttl: u64) -> Result<String, Error>;
+    /// Renew a lease; `Err` if it has already expired.
+    fn keep_alive(&mut self, lease: &str) -> Result<(), Error>;
+    /// Wait up to `wait` for the lock, held under `lease`. Returns the key
+    /// that proves ownership while it exists.
+    fn acquire(&mut self, lease: &str, wait: Duration) -> Result<String, Error>;
+    fn read_counter(&mut self) -> Result<u64, Error>;
+    /// Write the counter. With `fence`, only if that ownership key still
+    /// exists, atomically (`Err(Fail)` if it does not).
+    fn write_counter(&mut self, value: u64, fence: Option<&str>) -> Result<(), Error>;
+    fn release(&mut self, owner_key: &str) -> Result<(), Error>;
+    fn revoke(&mut self, lease: &str) -> Result<(), Error>;
+}
+
 pub trait Database: Send + Sync {
     fn name(&self) -> String;
     /// Start `node`'s processes (also used to restart it after a crash).
@@ -35,6 +52,15 @@ pub trait Database: Send + Sync {
         Ok(())
     }
     fn client(&self, cluster: &Cluster, node: usize, timeout: Duration) -> Box<dyn Client>;
+    /// A client for the lock workload, if the database offers locks.
+    fn lock_client(
+        &self,
+        _cluster: &Cluster,
+        _node: usize,
+        _timeout: Duration,
+    ) -> Option<Box<dyn LockClient>> {
+        None
+    }
     /// The node that currently leads, if the database has one and some
     /// node can say which.
     fn leader(&self, _cluster: &Cluster) -> Option<usize> {

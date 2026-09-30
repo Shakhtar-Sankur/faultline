@@ -7,6 +7,9 @@ use crate::db::Database;
 use crate::history::{self, Call, Outcome};
 use crate::test::{Config, Report};
 
+/// Whether a call is of one kind (for the per-kind table).
+type IsKind = fn(&Call) -> bool;
+
 /// The results summary, as printed and as saved.
 pub fn summary(r: &Report, db: &dyn Database, cfg: &Config) -> String {
     let mut out = String::new();
@@ -21,19 +24,47 @@ pub fn summary(r: &Report, db: &dyn Database, cfg: &Config) -> String {
         cfg.target,
         cfg.seed
     );
-    let _ = writeln!(
-        out,
-        "\n  {:<6} {:>7} {:>7} {:>8}   latency of ok (p50 / p99)",
-        "op", "ok", "fail", "unknown"
-    );
-    for (name, pick) in [
-        (
-            "read",
-            (|c: &Call| matches!(c, Call::Read(_))) as fn(&Call) -> bool,
-        ),
-        ("write", |c| matches!(c, Call::Write(_))),
-        ("cas", |c| matches!(c, Call::Cas(..))),
-    ] {
+    if let Some((ops, l)) = &r.locks {
+        let stalls = ops.iter().filter(|o| o.stalled).count();
+        let _ = writeln!(
+            out,
+            "\n  workload: lock ({:?}), {} acquisitions, {} stalled past their lease",
+            cfg.workload, l.acquisitions, stalls
+        );
+        let _ = writeln!(
+            out,
+            "  {} increments acknowledged, {} refused by the fence",
+            l.increments, l.fenced_out
+        );
+        let _ = writeln!(
+            out,
+            "  mutual exclusion: {} times two clients held the lock at once",
+            l.overlaps.len()
+        );
+        for (a, b, from, to) in l.overlaps.iter().take(3) {
+            let _ = writeln!(
+                out,
+                "    p{a} and p{b} both held it from {:.3}s to {:.3}s",
+                *from as f64 / 1e9,
+                *to as f64 / 1e9
+            );
+        }
+    }
+    let register_ops: &[(&str, IsKind)] = if r.locks.is_some() {
+        &[]
+    } else {
+        let _ = writeln!(
+            out,
+            "\n  {:<6} {:>7} {:>7} {:>8}   latency of ok (p50 / p99)",
+            "op", "ok", "fail", "unknown"
+        );
+        &[
+            ("read", |c| matches!(c, Call::Read(_))),
+            ("write", |c| matches!(c, Call::Write(_))),
+            ("cas", |c| matches!(c, Call::Cas(..))),
+        ]
+    };
+    for &(name, pick) in register_ops {
         let ops: Vec<_> = r.history.iter().filter(|o| pick(&o.call)).collect();
         let count = |k: Outcome| ops.iter().filter(|o| o.outcome == k).count();
         let mut lat: Vec<u64> = ops
@@ -64,6 +95,33 @@ pub fn summary(r: &Report, db: &dyn Database, cfg: &Config) -> String {
         let _ = writeln!(out, "    {:>8.3}s  {what}", *t as f64 / 1e9);
     }
     let _ = writeln!(out);
+    if let Some((_, l)) = &r.locks {
+        if l.valid() {
+            let _ = writeln!(
+                out,
+                "  VALID: no lost updates: every acknowledged increment read a distinct value"
+            );
+        } else {
+            let lost: usize = l.lost_updates.iter().map(|(_, ps)| ps.len() - 1).sum();
+            let _ = writeln!(
+                out,
+                "  INVALID: {lost} lost updates: acknowledged increments that read the same value"
+            );
+            for (v, ps) in l.lost_updates.iter().take(3) {
+                let _ = writeln!(
+                    out,
+                    "    counter {v}: incremented by p{ps:?}, each writing {}",
+                    v + 1
+                );
+            }
+        }
+        let _ = writeln!(
+            out,
+            "\n  history, nemesis log and node logs: {}",
+            r.dir.display()
+        );
+        return out;
+    }
     match r.valid() {
         Some(true) => {
             let _ = writeln!(

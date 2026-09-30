@@ -5,10 +5,11 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::checker::linearizable::{self, Violation};
+use crate::checker::lock::{self as lockcheck, LockOp, LockReport};
 use crate::cluster::Cluster;
 use crate::db::{self, Database, Error};
 use crate::history::{Call, Op, Outcome};
@@ -22,6 +23,19 @@ pub enum Fault {
     Kill,
     /// SIGSTOP a node, SIGCONT it later.
     Pause,
+}
+
+/// What the clients do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Workload {
+    /// Reads, writes and compare-and-set on single keys; checked for
+    /// linearizability.
+    Register,
+    /// Increment a counter while holding a lease-based lock; checked for
+    /// mutual exclusion and lost updates. `fenced` makes each write
+    /// conditional on still owning the lock; `stall_percent` of critical
+    /// sections stall past the lease, as a long GC pause would.
+    Lock { fenced: bool, stall_percent: u64 },
 }
 
 /// Which node a fault picks.
@@ -54,6 +68,7 @@ pub struct Config {
     pub fault_gap: Duration,
     pub fault_for: Duration,
     pub target: Target,
+    pub workload: Workload,
     /// Operations on one key before clients move to the next, which keeps
     /// each key's history small enough to check exhaustively.
     pub ops_per_key: u64,
@@ -74,11 +89,16 @@ pub struct Report {
     pub violations: Vec<Violation>,
     /// Keys whose check exceeded its search budget.
     pub undecided: Vec<u64>,
+    /// The lock workload's operations and verdict.
+    pub locks: Option<(Vec<LockOp>, LockReport)>,
     pub dir: PathBuf,
 }
 
 impl Report {
     pub fn valid(&self) -> Option<bool> {
+        if let Some((_, l)) = &self.locks {
+            return Some(l.valid());
+        }
         if !self.violations.is_empty() {
             Some(false)
         } else if !self.undecided.is_empty() {
@@ -133,9 +153,32 @@ pub fn run(db: &dyn Database, cfg: &Config) -> Result<Report, String> {
     let history: Mutex<Vec<Op>> = Mutex::new(Vec::new());
     let nemesis_log: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
     let next_op = AtomicU64::new(0);
+    let lock_ops: Mutex<Vec<LockOp>> = Mutex::new(Vec::new());
 
     std::thread::scope(|s| {
-        for p in 0..cfg.clients {
+        if let Workload::Lock {
+            fenced,
+            stall_percent,
+        } = cfg.workload
+        {
+            for p in 0..cfg.clients {
+                let (cluster, out) = (&cluster, &lock_ops);
+                s.spawn(move || {
+                    lock_client(
+                        db,
+                        cluster,
+                        cfg,
+                        p,
+                        deadline,
+                        t0,
+                        fenced,
+                        stall_percent,
+                        out,
+                    )
+                });
+            }
+        }
+        for p in (0..cfg.clients).filter(|_| cfg.workload == Workload::Register) {
             let (history, next_op, cluster) = (&history, &next_op, &cluster);
             s.spawn(move || {
                 let node = p % cfg.nodes;
@@ -203,12 +246,22 @@ pub fn run(db: &dyn Database, cfg: &Config) -> Result<Report, String> {
             Err(v) => violations.push(v),
         }
     }
+    let locks = match cfg.workload {
+        Workload::Lock { .. } => {
+            let mut ops = lock_ops.into_inner().unwrap();
+            ops.sort_by_key(|o| o.acquired);
+            let r = lockcheck::check(&ops);
+            Some((ops, r))
+        }
+        Workload::Register => None,
+    };
     let report = Report {
         keys: by_key.len(),
         history,
         nemesis: nemesis_log.into_inner().unwrap(),
         violations,
         undecided,
+        locks,
         dir,
     };
     crate::report::write(&report, db, cfg)?;
@@ -297,5 +350,90 @@ fn nemesis(
         if let Err(e) = result {
             note(format!("nemesis error: {e}"));
         }
+    }
+}
+
+/// One lock-workload client: take a lease, keep it alive in the
+/// background, acquire the lock, read the counter, write it plus one,
+/// release. Holding intervals and outcomes go to `out`.
+#[allow(clippy::too_many_arguments)]
+fn lock_client(
+    db: &dyn Database,
+    cluster: &Cluster,
+    cfg: &Config,
+    p: usize,
+    deadline: Instant,
+    t0: Instant,
+    fenced: bool,
+    stall_percent: u64,
+    out: &Mutex<Vec<LockOp>>,
+) {
+    const TTL: u64 = 2;
+    let ns = || t0.elapsed().as_nanos() as u64;
+    let node = p % cfg.nodes;
+    let Some(mut c) = db.lock_client(cluster, node, cfg.timeout) else {
+        return;
+    };
+    let mut rng = Rng::new(cfg.seed ^ ((p as u64 + 7) * 0x2545_F491));
+    while Instant::now() < deadline {
+        let Ok(lease) = c.grant(TTL) else {
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        };
+        let alive = AtomicBool::new(true);
+        std::thread::scope(|ks| {
+            // Renew the lease three times per TTL, as etcd's own clients do,
+            // until told to stop.
+            ks.spawn(|| {
+                let Some(mut k) = db.lock_client(cluster, node, cfg.timeout) else {
+                    return;
+                };
+                while alive.load(Ordering::Relaxed) {
+                    let _ = k.keep_alive(&lease);
+                    for _ in 0..(TTL * 1000 / 3 / 50) {
+                        if !alive.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                }
+            });
+            let Ok(owner) = c.acquire(&lease, Duration::from_secs(4)) else {
+                alive.store(false, Ordering::Relaxed);
+                return;
+            };
+            let acquired = ns();
+            let Ok(read) = c.read_counter() else {
+                let _ = c.release(&owner);
+                alive.store(false, Ordering::Relaxed);
+                return;
+            };
+            let stalled = rng.below(100) < stall_percent;
+            if stalled {
+                // A long pause of the lock holder: its keep-alives stop and
+                // the lease runs out while it still thinks it holds the lock.
+                alive.store(false, Ordering::Relaxed);
+                std::thread::sleep(Duration::from_secs(TTL + 1));
+            }
+            let wrote = match c.write_counter(read + 1, fenced.then_some(owner.as_str())) {
+                Ok(()) => Outcome::Ok,
+                Err(Error::Fail(_)) => Outcome::Fail,
+                Err(Error::Unknown(_)) => Outcome::Info,
+            };
+            let released = ns();
+            let _ = c.release(&owner);
+            alive.store(false, Ordering::Relaxed);
+            out.lock().unwrap().push(LockOp {
+                process: p,
+                node,
+                acquired,
+                released,
+                read,
+                wrote,
+                stalled,
+            });
+        });
+        let _ = c.revoke(&lease);
+        std::thread::sleep(cfg.op_delay);
     }
 }

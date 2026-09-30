@@ -13,7 +13,9 @@ it started, when it ended, and whether it succeeded, failed, or timed out
 with an unknown outcome) and then checks the history for
 **linearizability**, the strongest single-object consistency guarantee.
 
-The target today is **etcd**, the consensus store behind Kubernetes.
+The target today is **etcd**, the consensus store behind Kubernetes: its
+key-value operations for linearizability, and its locks for mutual
+exclusion and lost updates.
 
 ## Does it work? It catches stale reads, and passes correct ones
 
@@ -84,6 +86,43 @@ definite no, which the checker knows had no effect.)
 
 CI runs both directions on every push, against a real etcd release.
 
+## Locks: what etcd's documentation warns about, measured
+
+etcd's lock is held by whoever owns the oldest key under the lock's name,
+and each key is tied to its owner's lease. If the owner stalls (a long GC
+pause, a stalled VM) and its lease expires, the key vanishes and someone
+else gets the lock, while the stalled owner still believes it holds it.
+etcd's documentation therefore recommends making writes conditional on
+still owning the lock. `--workload lock` measures both: every client, while
+holding the lock, reads a counter and writes it plus one. The checker
+reports times two clients held the lock at once (every client shares the
+test machine's clock, so holding intervals compare directly) and **lost
+updates**: acknowledged increments that read the same value.
+
+| Run (etcd 3.5.17, 3 nodes, 10 clients) | Lock held twice at once | Increments fenced out | Lost updates | Verdict |
+|---|---|---|---|---|
+| Naive lock, no faults, 30 s | 0 | 0 | 0 | valid |
+| Naive lock, 5% of holders stall past their lease, 40 s | 266 | 0 | **121** | **invalid** |
+| Fenced writes (etcd's recommendation), same stalls, 40 s | 251 | 18 (one per stall) | 0 | valid |
+| Naive lock, partitions, crashes and pauses of etcd nodes, no stalls, 120 s | 0 | 0 | 0 | valid |
+
+```
+$ sudo faultline test etcd --etcd ./etcd --workload lock --stall-percent 5 --time 40
+  workload: lock (Lock { fenced: false, stall_percent: 5 }), 268 acquisitions, 19 stalled past their lease
+  268 increments acknowledged, 0 refused by the fence
+  mutual exclusion: 266 times two clients held the lock at once
+  INVALID: 121 lost updates: acknowledged increments that read the same value
+    counter 1: incremented by p[8, 1], each writing 2
+```
+
+A stalled holder wakes up and writes a value it read seconds earlier,
+dragging the counter back, so one stall costs many updates. With fenced
+writes each stalled holder's write is refused instead (18 stalls, 18
+refusals) and nothing is lost, though the lock itself still overlaps: the
+fence, not the lock, keeps the data safe. Faults on the etcd servers alone,
+with short critical sections, did not break the lock in 120 seconds; the
+hazard needs the holder itself to outlive its lease.
+
 ## How it works
 
 - **Nodes in network namespaces.** Each node gets a namespace, a veth pair
@@ -130,8 +169,8 @@ with no arguments lists them.
 
 - One database so far. Faults are partitions, crashes and pauses; clock
   skew, disk faults and membership changes are not yet modeled.
-- The workload is a single-key register. Multi-key transactions, watches
-  and leases are not yet checked.
+- Workloads are a single-key register and a lease-based lock.
+  Multi-key transactions and watches are not yet checked.
 - Every node shares one machine, so timing differs from a real
   multi-machine deployment; it finds ordering bugs, not performance ones.
 

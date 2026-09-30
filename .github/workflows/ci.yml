@@ -41,6 +41,18 @@ jobs:
           code=$?
           head -40 out.txt | tee -a "$GITHUB_STEP_SUMMARY"
           if [ "$code" -ne 1 ]; then echo "expected the checker to find stale reads (exit 1), got $code" >&2; exit 1; fi
+      - name: naive locks lose updates when holders stall past their lease
+        run: |
+          set +e
+          sudo ./target/release/faultline test etcd --etcd etcd-$ETCD-linux-amd64/etcd \
+            --workload lock --stall-percent 5 --time 40 --faults none > lock.txt
+          code=$?
+          cat lock.txt | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "$code" -ne 1 ]; then echo "expected lost updates (exit 1), got $code" >&2; exit 1; fi
+      - name: fenced writes keep the data safe under the same stalls
+        run: |
+          sudo ./target/release/faultline test etcd --etcd etcd-$ETCD-linux-amd64/etcd \
+            --workload lock --fenced --stall-percent 5 --time 40 --faults none | tee -a "$GITHUB_STEP_SUMMARY"
       - name: keep histories and logs, not databases
         if: always()
         run: |
