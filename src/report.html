@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>faultline report</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --axis: #c3c2b7; --ring: rgba(11,11,11,0.10);
+  --s-ok: #2a78d6; --s-fail: #eb6834; --s-unknown: #1baf7a;
+  --fault: rgba(137,135,129,0.16); --fault-ink: #52514e;
+  --good: #006300; --critical: #d03b3b;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10);
+    --s-ok: #3987e5; --s-fail: #d95926; --s-unknown: #199e70;
+    --fault: rgba(195,194,183,0.12); --fault-ink: #c3c2b7;
+    --good: #0ca30c; --critical: #e66767;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --axis: #383835; --ring: rgba(255,255,255,0.10);
+  --s-ok: #3987e5; --s-fail: #d95926; --s-unknown: #199e70;
+  --fault: rgba(195,194,183,0.12); --fault-ink: #c3c2b7;
+  --good: #0ca30c; --critical: #e66767;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--page); color: var(--ink);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1180px; margin: 0 auto; padding: 24px 16px 48px; }
+h1 { font-size: 20px; margin: 0 0 4px; }
+h2 { font-size: 15px; margin: 0 0 2px; }
+.sub { color: var(--ink-2); margin: 0 0 16px; }
+.verdict { display: flex; gap: 10px; align-items: flex-start; padding: 12px 14px; border-radius: 10px;
+  background: var(--surface); border: 1px solid var(--ring); margin-bottom: 16px; }
+.verdict b { font-size: 15px; }
+.verdict .icon { font-size: 18px; line-height: 1.2; }
+.verdict.ok .icon, .verdict.ok b { color: var(--good); }
+.verdict.bad .icon, .verdict.bad b { color: var(--critical); }
+.verdict pre { margin: 6px 0 0; white-space: pre-wrap; word-break: break-word; color: var(--ink-2);
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 16px; }
+.tile { background: var(--surface); border: 1px solid var(--ring); border-radius: 10px; padding: 10px 12px; }
+.tile .v { font-size: 22px; font-weight: 600; }
+.tile .l { color: var(--ink-2); font-size: 12px; }
+.card { background: var(--surface); border: 1px solid var(--ring); border-radius: 10px; padding: 14px; margin-bottom: 16px; position: relative; }
+.card p.note { color: var(--ink-2); margin: 0 0 8px; font-size: 13px; }
+.legend { display: flex; flex-wrap: wrap; gap: 14px; color: var(--ink-2); font-size: 12px; margin: 6px 0 8px; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.key-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.key-line { width: 14px; height: 2px; display: inline-block; border-radius: 1px; }
+.key-band { width: 14px; height: 10px; display: inline-block; background: var(--fault); border: 1px solid var(--ring); }
+canvas { display: block; width: 100%; }
+.tip { position: absolute; pointer-events: none; background: var(--surface); color: var(--ink); border: 1px solid var(--ring);
+  border-radius: 8px; padding: 8px 10px; font-size: 12px; box-shadow: 0 4px 16px rgba(0,0,0,0.12); display: none; min-width: 150px; z-index: 2; }
+.tip strong { font-size: 13px; }
+.tip .row { display: flex; align-items: center; gap: 6px; margin-top: 2px; }
+.tip .muted { color: var(--ink-2); }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--grid); }
+th { color: var(--ink-2); font-weight: 600; }
+td.n { text-align: right; font-variant-numeric: tabular-nums; }
+.scroll { overflow-x: auto; }
+.grid2 { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }
+@media (max-width: 760px) { .grid2 { grid-template-columns: minmax(0, 1fr); } }
+</style>
+</head>
+<body>
+<main>
+  <h1 id="title">faultline report</h1>
+  <p class="sub" id="sub"></p>
+  <div class="verdict" id="verdict"><span class="icon" id="vicon"></span><div><b id="vtext"></b><pre id="vdetail"></pre></div></div>
+  <div class="tiles" id="tiles"></div>
+
+  <div class="card">
+    <h2>Latency of every operation</h2>
+    <p class="note">Each dot is one operation, at the time it began; height is how long it took (log scale). Unknown outcomes sit at the client timeout. "Failed" includes compare-and-sets whose comparison did not match, and requests refused by a crashed node. Shaded bands are faults.</p>
+    <div class="legend" id="leg1"></div>
+    <canvas id="lat" height="340" aria-label="Latency of every operation over time"></canvas>
+    <div class="tip" id="tip1"></div>
+  </div>
+
+  <div class="card">
+    <h2>Operations per second</h2>
+    <p class="note">How many operations completed each second, by outcome: availability through each fault.</p>
+    <div class="legend" id="leg2"></div>
+    <canvas id="rate" height="240" aria-label="Operations per second by outcome"></canvas>
+    <div class="tip" id="tip2"></div>
+  </div>
+
+  <div class="grid2">
+    <div class="card"><h2>Outcomes</h2><div class="scroll"><table id="counts"></table></div></div>
+    <div class="card"><h2>Faults injected</h2><div class="scroll"><table id="faults"></table></div></div>
+  </div>
+</main>
+<script>
+const D = /*DATA*/null;
+const OUT = ["ok", "fail", "unknown"];
+const VARS = ["--s-ok", "--s-fail", "--s-unknown"];
+const LABEL = ["ok", "failed (definitely no effect)", "unknown (timed out)"];
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const $ = id => document.getElementById(id);
+const el = (tag, text, cls) => { const e = document.createElement(tag); if (text !== undefined) e.textContent = text; if (cls) e.className = cls; return e; };
+
+$("title").textContent = "faultline: " + D.db;
+$("sub").textContent = D.config;
+$("verdict").classList.add(D.valid ? "ok" : "bad");
+$("vicon").textContent = D.valid ? "✓" : "✗";
+$("vtext").textContent = D.verdict;
+$("vdetail").textContent = D.detail;
+if (!D.detail) $("vdetail").remove();
+
+// Points: [t_ms, latency_ms, outcome, kind, node, key]
+const P = D.points;
+const counts = [0, 0, 0];
+P.forEach(p => counts[p[2]]++);
+const tiles = [
+  [P.length.toLocaleString(), "operations"],
+  [(P.length ? (100 * counts[0] / P.length).toFixed(1) : "0") + "%", "ok (the rest failed or timed out)"],
+  [counts[2].toLocaleString(), "unknown outcome"],
+  [D.faults.length.toString(), "faults injected"],
+];
+for (const [v, l] of tiles) { const t = el("div", undefined, "tile"); t.append(el("div", v, "v"), el("div", l, "l")); $("tiles").append(t); }
+
+function legend(id, kind) {
+  const L = $(id);
+  OUT.forEach((o, i) => {
+    if (!counts[i]) return;
+    const s = el("span"); const k = el("i", undefined, kind === "line" ? "key-line" : "key-dot");
+    k.style.background = `var(${VARS[i]})`; s.append(k, document.createTextNode(LABEL[i])); L.append(s);
+  });
+  const s = el("span"); s.append(el("i", undefined, "key-band"), document.createTextNode("fault in progress")); L.append(s);
+  if (D.violations.length) {
+    const v = el("span"); const k = el("i", undefined, "key-line"); k.style.background = "var(--critical)"; k.style.height = "4px";
+    v.append(k, document.createTextNode("✗ where a violation was found")); L.append(v);
+  }
+}
+legend("leg1", "dot"); legend("leg2", "line");
+
+// Tables (the non-visual route to every number).
+const ct = $("counts");
+const hr = el("tr"); ["operation", "ok", "failed", "unknown"].forEach((h, i) => { const th = el("th", h); if (i) th.style.textAlign = "right"; hr.append(th); }); ct.append(hr);
+const kinds = [...new Set(P.map(p => p[3]))];
+for (const k of kinds) {
+  const tr = el("tr"); tr.append(el("td", k));
+  for (let o = 0; o < 3; o++) tr.append(el("td", P.filter(p => p[3] === k && p[2] === o).length.toLocaleString(), "n"));
+  ct.append(tr);
+}
+const ft = $("faults");
+const fh = el("tr"); ["from", "to", "fault"].forEach(h => fh.append(el("th", h))); ft.append(fh);
+if (!D.faults.length) { const tr = el("tr"); const td = el("td", "none"); td.colSpan = 3; tr.append(td); ft.append(tr); }
+for (const [a, b, what] of D.faults) {
+  const tr = el("tr"); tr.append(el("td", (a / 1000).toFixed(1) + "s", "n"), el("td", (b / 1000).toFixed(1) + "s", "n"), el("td", what)); ft.append(tr);
+}
+
+const END = Math.max(D.duration_ms, ...P.map(p => p[0]), 1);
+const PAD = { l: 52, r: 12, t: 22, b: 30 };
+
+function setup(canvas) {
+  const dpr = window.devicePixelRatio || 1, w = canvas.clientWidth, h = canvas.height / (canvas._dpr || 1);
+  canvas._dpr = dpr; canvas.style.height = h + "px";
+  canvas.width = w * dpr; canvas.height = h * dpr;
+  const g = canvas.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  return { g, w, h, x: t => PAD.l + (w - PAD.l - PAD.r) * t / END, inv: px => (px - PAD.l) / (w - PAD.l - PAD.r) * END };
+}
+
+function bands(c) {
+  const { g, h, x } = c;
+  g.font = "11px system-ui, sans-serif";
+  for (const [a, b, what] of D.faults) {
+    g.fillStyle = css("--fault"); g.fillRect(x(a), PAD.t, Math.max(1, x(b) - x(a)), h - PAD.t - PAD.b);
+    g.fillStyle = css("--fault-ink");
+    const label = what.split(":")[0].split(" (")[0];
+    if (x(b) - x(a) > g.measureText(label).width + 6) g.fillText(label, x(a) + 3, PAD.t - 6);
+  }
+  for (const [a, b, what] of D.violations) {
+    g.fillStyle = css("--critical"); g.fillRect(x(a), h - PAD.b + 2, Math.max(2, x(b) - x(a)), 4);
+  }
+}
+
+function timeAxis(c) {
+  const { g, w, h, x } = c;
+  g.fillStyle = css("--muted"); g.font = "11px system-ui, sans-serif"; g.textAlign = "center";
+  const step = END > 120000 ? 30000 : END > 40000 ? 10000 : 5000;
+  for (let t = 0; t <= END; t += step) g.fillText((t / 1000) + "s", x(t), h - PAD.b + 18);
+  g.strokeStyle = css("--axis"); g.lineWidth = 1; g.beginPath(); g.moveTo(PAD.l, h - PAD.b + 0.5); g.lineTo(w - PAD.r, h - PAD.b + 0.5); g.stroke();
+  g.textAlign = "left";
+}
+
+// Latency scatter, log scale.
+const lat = $("lat");
+let latC, grid = new Map();
+const LMIN = 0.1, LMAX = Math.max(10, ...P.map(p => p[1]));
+function drawLat() {
+  latC = setup(lat); const { g, w, h, x } = latC;
+  const y = ms => { const f = (Math.log10(Math.max(ms, LMIN)) - Math.log10(LMIN)) / (Math.log10(LMAX) - Math.log10(LMIN)); return h - PAD.b - f * (h - PAD.t - PAD.b); };
+  latC.y = y;
+  g.clearRect(0, 0, w, h);
+  bands(latC);
+  g.font = "11px system-ui, sans-serif";
+  for (let d = Math.ceil(Math.log10(LMIN)); d <= Math.log10(LMAX); d++) {
+    const v = Math.pow(10, d), yy = Math.round(y(v)) + 0.5;
+    g.strokeStyle = css("--grid"); g.beginPath(); g.moveTo(PAD.l, yy); g.lineTo(w - PAD.r, yy); g.stroke();
+    g.fillStyle = css("--muted"); g.textAlign = "right"; g.fillText(v >= 1000 ? (v / 1000) + " s" : v + " ms", PAD.l - 6, yy + 4);
+  }
+  g.textAlign = "left";
+  timeAxis(latC);
+  grid = new Map();
+  // Draw unknown and failed last, so the rarer outcomes stay visible.
+  for (const o of [0, 1, 2]) {
+    g.fillStyle = css(VARS[o]); g.globalAlpha = o === 0 ? 0.35 : 0.85;
+    for (let i = 0; i < P.length; i++) {
+      const p = P[i]; if (p[2] !== o) continue;
+      const px = x(p[0]), py = y(p[1]);
+      g.beginPath(); g.arc(px, py, o === 0 ? 1.6 : 2.4, 0, 6.2832); g.fill();
+      const key = ((px / 12) | 0) + "," + ((py / 12) | 0);
+      (grid.get(key) || grid.set(key, []).get(key)).push(i);
+    }
+  }
+  g.globalAlpha = 1;
+}
+
+function showTip(tip, canvas, px, py, build) {
+  tip.replaceChildren(); build(tip); tip.style.display = "block";
+  const cw = canvas.parentElement.clientWidth, tw = tip.offsetWidth;
+  tip.style.left = Math.min(cw - tw - 8, px + canvas.offsetLeft + 14) + "px";
+  tip.style.top = (py + canvas.offsetTop - 10) + "px";
+}
+
+lat.addEventListener("pointermove", e => {
+  const r = lat.getBoundingClientRect(), mx = e.clientX - r.left, my = e.clientY - r.top;
+  let best = -1, bd = 24 * 24;
+  const cx = (mx / 12) | 0, cy = (my / 12) | 0;
+  for (let dx = -2; dx <= 2; dx++) for (let dy = -2; dy <= 2; dy++) {
+    for (const i of grid.get((cx + dx) + "," + (cy + dy)) || []) {
+      const p = P[i], ddx = latC.x(p[0]) - mx, ddy = latC.y(p[1]) - my, d = ddx * ddx + ddy * ddy;
+      if (d < bd) { bd = d; best = i; }
+    }
+  }
+  const tip = $("tip1");
+  if (best < 0) { tip.style.display = "none"; return; }
+  const p = P[best];
+  showTip(tip, lat, latC.x(p[0]), latC.y(p[1]), t => {
+    t.append(el("strong", p[1] >= 1000 ? (p[1] / 1000).toFixed(2) + " s" : p[1].toFixed(1) + " ms"));
+    const row = el("div", undefined, "row"); const k = el("i", undefined, "key-line"); k.style.background = `var(${VARS[p[2]]})`;
+    row.append(k, document.createTextNode(`${p[3]} · ${OUT[p[2]]}`)); t.append(row);
+    t.append(el("div", `began ${(p[0] / 1000).toFixed(3)}s · node n${p[4]}` + (p[5] >= 0 ? ` · key ${p[5]}` : ""), "muted"));
+  });
+});
+lat.addEventListener("pointerleave", () => { $("tip1").style.display = "none"; });
+
+// Operations per second, one line per outcome.
+const rate = $("rate");
+const SECS = Math.ceil(END / 1000);
+const per = [0, 1, 2].map(() => new Array(SECS + 1).fill(0));
+P.forEach(p => { per[p[2]][Math.min(SECS, Math.floor((p[0] + p[1]) / 1000))]++; });
+let rateC;
+function drawRate(hover) {
+  rateC = setup(rate); const { g, w, h, x } = rateC;
+  const max = Math.max(1, ...per.flat());
+  const y = v => h - PAD.b - v / max * (h - PAD.t - PAD.b);
+  g.clearRect(0, 0, w, h);
+  bands(rateC);
+  g.font = "11px system-ui, sans-serif"; g.textAlign = "right";
+  const step = Math.pow(10, Math.floor(Math.log10(max)));
+  for (let v = 0; v <= max; v += step * (max / step > 5 ? 2 : 1)) {
+    const yy = Math.round(y(v)) + 0.5;
+    g.strokeStyle = css("--grid"); g.beginPath(); g.moveTo(PAD.l, yy); g.lineTo(w - PAD.r, yy); g.stroke();
+    g.fillStyle = css("--muted"); g.fillText(v.toLocaleString(), PAD.l - 6, yy + 4);
+  }
+  g.textAlign = "left";
+  timeAxis(rateC);
+  g.lineWidth = 2; g.lineJoin = "round";
+  for (const o of [0, 1, 2]) {
+    if (!counts[o]) continue;
+    g.strokeStyle = css(VARS[o]); g.beginPath();
+    per[o].forEach((v, s) => { const px = x(s * 1000 + 500), py = y(v); s ? g.lineTo(px, py) : g.moveTo(px, py); });
+    g.stroke();
+  }
+  if (hover !== undefined) {
+    const px = Math.round(x(hover * 1000 + 500)) + 0.5;
+    g.strokeStyle = css("--axis"); g.lineWidth = 1; g.beginPath(); g.moveTo(px, PAD.t); g.lineTo(px, h - PAD.b); g.stroke();
+  }
+}
+rate.addEventListener("pointermove", e => {
+  const r = rate.getBoundingClientRect(), mx = e.clientX - r.left;
+  const s = Math.max(0, Math.min(SECS, Math.floor(rateC.inv(mx) / 1000)));
+  drawRate(s);
+  showTip($("tip2"), rate, rateC.x(s * 1000 + 500), 30, t => {
+    t.append(el("div", `second ${s} to ${s + 1}`, "muted"));
+    for (const o of [0, 1, 2]) {
+      if (!counts[o]) continue;
+      const row = el("div", undefined, "row"); const k = el("i", undefined, "key-line"); k.style.background = `var(${VARS[o]})`;
+      row.append(k, el("strong", per[o][s].toLocaleString()), document.createTextNode(" " + OUT[o])); t.append(row);
+    }
+    const f = D.faults.filter(([a, b]) => a <= s * 1000 + 1000 && b >= s * 1000).map(f => f[2]);
+    if (f.length) t.append(el("div", "during: " + f.join("; "), "muted"));
+  });
+});
+rate.addEventListener("pointerleave", () => { $("tip2").style.display = "none"; drawRate(); });
+
+function drawAll() { drawLat(); drawRate(); }
+window.addEventListener("resize", drawAll);
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", drawAll);
+drawAll();
+</script>
+</body>
+</html>

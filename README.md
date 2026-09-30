@@ -86,6 +86,18 @@ definite no, which the checker knows had no effect.)
 
 CI runs both directions on every push, against a real etcd release.
 
+## Every run leaves a report
+
+Each run writes `report.html`: one self-contained page showing the latency
+of every operation over time and throughput by outcome, with every fault
+shaded and every violation marked, plus hover detail for each point. For
+the passing run above: each partition and pause shows as a burst of
+operations with unknown outcomes (dots at the one-second timeout) and a dip
+in throughput; each `kill -9` shows the clients bound to the dead node
+failing instantly while the rest carry on.
+
+![faultline's report for etcd under partitions, crashes and pauses](docs/report.png)
+
 ## Locks: what etcd's documentation warns about, measured
 
 etcd's lock is held by whoever owns the oldest key under the lock's name,
@@ -183,9 +195,9 @@ $ sudo faultline test etcd --etcd ./etcd --workload watch --watch-resume 2 --tim
   with reads, writes and compare-and-set. Clients move to a fresh key every
   150 operations, and keys are checked independently (linearizability is
   compositional), which keeps every search exhaustive.
-- **Everything saved.** Each run leaves `history.jsonl` (every operation),
-  `nemesis.txt` (every fault, timestamped), `results.txt`, and each node's
-  logs under `store/`.
+- **Everything saved.** Each run leaves `report.html`, `history.jsonl`
+  (every operation), `nemesis.txt` (every fault, timestamped),
+  `results.txt`, and each node's logs under `store/`.
 
 ## Run it
 

@@ -38,8 +38,14 @@ pub fn post(
     s.write_all(req.as_bytes())
         .map_err(|e| HttpError::Unknown(format!("write: {e}")))?;
     let mut raw = Vec::new();
-    s.read_to_end(&mut raw)
-        .map_err(|e| HttpError::Unknown(format!("read: {e}")))?;
+    s.read_to_end(&mut raw).map_err(|e| {
+        HttpError::Unknown(match e.kind() {
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+                format!("no answer within {} ms", timeout.as_millis())
+            }
+            _ => format!("read: {e}"),
+        })
+    })?;
     parse_response(&raw).ok_or_else(|| HttpError::Unknown("malformed or truncated response".into()))
 }
 

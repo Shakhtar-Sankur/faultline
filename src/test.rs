@@ -99,8 +99,10 @@ pub struct Report {
     pub undecided: Vec<u64>,
     /// The lock workload's operations and verdict.
     pub locks: Option<(Vec<LockOp>, LockReport)>,
-    pub watch: Option<WatchReport>,
+    pub watch: Option<(Vec<WatchWrite>, WatchReport)>,
     pub dir: PathBuf,
+    /// How long the workload ran, in ns.
+    pub duration: u64,
 }
 
 impl Report {
@@ -108,7 +110,7 @@ impl Report {
         if let Some((_, l)) = &self.locks {
             return Some(l.valid());
         }
-        if let Some(w) = &self.watch {
+        if let Some((_, w)) = &self.watch {
             return Some(w.valid());
         }
         if !self.violations.is_empty() {
@@ -183,9 +185,9 @@ pub fn run(db: &dyn Database, cfg: &Config) -> Result<Report, String> {
             let next_value = &next_op;
             for p in 0..cfg.clients {
                 let (cluster, out) = (&cluster, &watch_writes);
-                workers.push(
-                    s.spawn(move || watch_writer(db, cluster, cfg, p, deadline, next_value, out)),
-                );
+                workers.push(s.spawn(move || {
+                    watch_writer(db, cluster, cfg, p, deadline, t0, next_value, out)
+                }));
             }
             for node in 0..cfg.nodes {
                 let (cluster, out) = (&cluster, &watchers);
@@ -321,14 +323,17 @@ pub fn run(db: &dyn Database, cfg: &Config) -> Result<Report, String> {
     let watch = (cfg.workload == Workload::Watch).then(|| {
         let mut ws = watchers.into_inner().unwrap();
         ws.sort_by_key(|w| w.node);
-        watchcheck::check(
-            &watch_writes.into_inner().unwrap(),
+        let writes = watch_writes.into_inner().unwrap();
+        let r = watchcheck::check(
+            &writes,
             &ws,
             first_revision,
             watch_target.load(Ordering::SeqCst),
-        )
+        );
+        (writes, r)
     });
     let report = Report {
+        duration: cfg.time.as_nanos() as u64,
         watch,
         keys: by_key.len(),
         history,
@@ -532,12 +537,14 @@ fn current_revision(db: &dyn Database, cluster: &Cluster, cfg: &Config) -> Resul
 }
 
 /// A watch-workload writer: unique values to a handful of keys.
+#[allow(clippy::too_many_arguments)]
 fn watch_writer(
     db: &dyn Database,
     cluster: &Cluster,
     cfg: &Config,
     p: usize,
     deadline: Instant,
+    t0: Instant,
     next_value: &AtomicU64,
     out: &Mutex<Vec<WatchWrite>>,
 ) {
@@ -547,7 +554,10 @@ fn watch_writer(
     let mut rng = Rng::new(cfg.seed ^ ((p as u64 + 3) * 0x9E37_79B9));
     while Instant::now() < deadline {
         let (key, value) = (rng.below(5), next_value.fetch_add(1, Ordering::Relaxed));
-        let (outcome, revision) = match c.put(key, value) {
+        let start = t0.elapsed().as_nanos() as u64;
+        let result = c.put(key, value);
+        let end = t0.elapsed().as_nanos() as u64;
+        let (outcome, revision) = match result {
             Ok(rev) => (Outcome::Ok, Some(rev)),
             Err(Error::Fail(_)) => (Outcome::Fail, None),
             Err(Error::Unknown(_)) => (Outcome::Info, None),
@@ -558,6 +568,9 @@ fn watch_writer(
             value,
             outcome,
             revision,
+            node: p % cfg.nodes,
+            start,
+            end,
         });
         std::thread::sleep(cfg.op_delay);
     }

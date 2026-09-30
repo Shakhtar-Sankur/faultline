@@ -50,7 +50,7 @@ pub fn summary(r: &Report, db: &dyn Database, cfg: &Config) -> String {
             );
         }
     }
-    if let Some(w) = &r.watch {
+    if let Some((_, w)) = &r.watch {
         let _ = writeln!(
             out,
             "\n  workload: watch, {} acknowledged writes, revisions up to {}",
@@ -107,7 +107,7 @@ pub fn summary(r: &Report, db: &dyn Database, cfg: &Config) -> String {
         let _ = writeln!(out, "    {:>8.3}s  {what}", *t as f64 / 1e9);
     }
     let _ = writeln!(out);
-    if let Some(w) = &r.watch {
+    if let Some((_, w)) = &r.watch {
         if w.valid() {
             let _ = writeln!(
                 out,
@@ -213,5 +213,194 @@ pub fn write(r: &Report, db: &dyn Database, cfg: &Config) -> Result<(), String> 
         .collect();
     std::fs::write(r.dir.join("nemesis.txt"), nemesis.join("\n") + "\n")
         .map_err(|e| e.to_string())?;
-    std::fs::write(r.dir.join("results.txt"), summary(r, db, cfg)).map_err(|e| e.to_string())
+    std::fs::write(r.dir.join("results.txt"), summary(r, db, cfg)).map_err(|e| e.to_string())?;
+    std::fs::write(r.dir.join("report.html"), html(r, db, cfg)).map_err(|e| e.to_string())
 }
+
+fn outcome_code(o: Outcome) -> u8 {
+    match o {
+        Outcome::Ok => 0,
+        Outcome::Fail => 1,
+        Outcome::Info => 2,
+    }
+}
+
+fn ms(ns: u64) -> String {
+    format!("{:.3}", ns as f64 / 1e6)
+}
+
+/// Pair each fault with its repair: `(from ns, to ns, what)`.
+fn fault_intervals(r: &Report) -> Vec<(u64, u64, String)> {
+    let mut out: Vec<(u64, u64, String)> = Vec::new();
+    let mut open: Vec<usize> = Vec::new();
+    for (t, what) in &r.nemesis {
+        let repair = ["heal", "restart", "resume"]
+            .iter()
+            .any(|w| what.starts_with(w));
+        if repair {
+            if let Some(i) = open.pop() {
+                out[i].1 = *t;
+            }
+        } else if !what.starts_with("nemesis error") {
+            open.push(out.len());
+            out.push((*t, r.duration, what.clone()));
+        }
+    }
+    out
+}
+
+/// The run as one self-contained page: every operation's latency over
+/// time, throughput by outcome, faults shaded, violations marked.
+pub fn html(r: &Report, db: &dyn Database, cfg: &Config) -> String {
+    use crate::json::quote;
+    let mut points: Vec<String> = Vec::new();
+    let mut violations: Vec<(u64, u64, String)> = Vec::new();
+    let (verdict, detail);
+    if let Some((ops, l)) = &r.locks {
+        for o in ops {
+            points.push(format!(
+                "[{},{},{},\"lock held\",{},-1]",
+                ms(o.acquired),
+                ms(o.released - o.acquired),
+                outcome_code(o.wrote),
+                o.node + 1
+            ));
+        }
+        for (v, ps) in &l.lost_updates {
+            let times: Vec<&crate::checker::lock::LockOp> = ops
+                .iter()
+                .filter(|o| o.read == *v && ps.contains(&o.process))
+                .collect();
+            if let (Some(a), Some(b)) = (
+                times.iter().map(|o| o.acquired).min(),
+                times.iter().map(|o| o.released).max(),
+            ) {
+                violations.push((a, b, format!("lost update of counter {v}")));
+            }
+        }
+        verdict = if l.valid() {
+            format!(
+                "Valid: no lost updates ({} increments; lock held twice at once {} times)",
+                l.increments,
+                l.overlaps.len()
+            )
+        } else {
+            let lost: usize = l.lost_updates.iter().map(|(_, ps)| ps.len() - 1).sum();
+            format!(
+                "Invalid: {lost} lost updates; lock held twice at once {} times",
+                l.overlaps.len()
+            )
+        };
+        detail = l
+            .lost_updates
+            .iter()
+            .take(5)
+            .map(|(v, ps)| {
+                format!(
+                    "counter {v}: incremented by p{ps:?}, each writing {}",
+                    v + 1
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+    } else if let Some((writes, w)) = &r.watch {
+        for o in writes {
+            points.push(format!(
+                "[{},{},{},\"watched write\",{},{}]",
+                ms(o.start),
+                ms(o.end - o.start),
+                outcome_code(o.outcome),
+                o.node + 1,
+                o.key
+            ));
+        }
+        verdict = if w.valid() {
+            format!(
+                "Valid: {} watchers saw all {} revisions once each, in order, and agreed",
+                w.watchers,
+                w.final_revision.saturating_sub(1)
+            )
+        } else {
+            format!("Invalid: {} watch violations", w.violations.len())
+        };
+        detail = w
+            .violations
+            .iter()
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+    } else {
+        for o in &r.history {
+            let kind = match o.call {
+                Call::Read(_) => "read",
+                Call::Write(_) => "write",
+                Call::Cas(..) => "cas",
+                Call::Add(_) => "add",
+                Call::ReadSet(_) => "read set",
+            };
+            points.push(format!(
+                "[{},{},{},\"{kind}\",{},{}]",
+                ms(o.start),
+                ms(o.end - o.start),
+                outcome_code(o.outcome),
+                o.node + 1,
+                o.key
+            ));
+        }
+        for v in &r.violations {
+            let ops = r.history.iter().filter(|o| o.key == v.key);
+            let (a, b) = ops.fold((u64::MAX, 0), |(a, b), o| (a.min(o.start), b.max(o.end)));
+            violations.push((a, b, format!("key {} not linearizable", v.key)));
+        }
+        verdict = match r.valid() {
+            Some(true) => format!("Valid: all {} keys' histories are linearizable", r.keys),
+            Some(false) => format!(
+                "Invalid: {} of {} keys' histories are not linearizable",
+                r.violations.len(),
+                r.keys
+            ),
+            None => format!(
+                "Undecided: {} keys were too complex to check",
+                r.undecided.len()
+            ),
+        };
+        detail = r
+            .violations
+            .first()
+            .map(|v| format!("key {}: {}", v.key, v.explanation))
+            .unwrap_or_default();
+    }
+    let triple = |v: &[(u64, u64, String)]| {
+        v.iter()
+            .map(|(a, b, w)| format!("[{},{},{}]", ms(*a), ms(*b), quote(w)))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let config = format!(
+        "{} nodes, {} clients, {}s, workload {:?}, faults {:?} on {:?} nodes, seed {}",
+        cfg.nodes,
+        cfg.clients,
+        cfg.time.as_secs(),
+        cfg.workload,
+        cfg.faults,
+        cfg.target,
+        cfg.seed
+    );
+    let data = format!(
+        "{{\"db\":{},\"config\":{},\"valid\":{},\"verdict\":{},\"detail\":{},\"duration_ms\":{},\"faults\":[{}],\"violations\":[{}],\"points\":[{}]}}",
+        quote(&db.name()),
+        quote(&config),
+        r.valid() == Some(true),
+        quote(&verdict),
+        quote(&detail),
+        ms(r.duration),
+        triple(&fault_intervals(r)),
+        triple(&violations),
+        points.join(",")
+    );
+    // Keep the data from closing the script element.
+    HTML.replace("/*DATA*/null", &data.replace("</", "<\\/"))
+}
+
+const HTML: &str = include_str!("report.html");

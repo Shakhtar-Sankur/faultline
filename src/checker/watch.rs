@@ -23,6 +23,10 @@ pub struct WatchWrite {
     pub outcome: Outcome,
     /// The revision the write created, if acknowledged.
     pub revision: Option<u64>,
+    pub node: usize,
+    /// When it began and ended (ns since the test began).
+    pub start: u64,
+    pub end: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -159,6 +163,9 @@ mod tests {
             value,
             outcome: Outcome::Ok,
             revision: Some(revision),
+            node: 0,
+            start: 0,
+            end: 0,
         }
     }
 
