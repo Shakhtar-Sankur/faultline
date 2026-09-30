@@ -203,7 +203,38 @@ pub fn summary(r: &Report, db: &dyn Database, cfg: &Config) -> String {
 }
 
 pub fn write(r: &Report, db: &dyn Database, cfg: &Config) -> Result<(), String> {
-    let lines: Vec<String> = r.history.iter().map(history::to_json).collect();
+    let outcome = |o: Outcome| format!("{o:?}").to_lowercase();
+    let mut lines: Vec<String> = r.history.iter().map(history::to_json).collect();
+    if let Some((ops, _)) = &r.locks {
+        lines.extend(ops.iter().map(|o| {
+            format!(
+                "{{\"process\":{},\"node\":{},\"f\":\"lock-increment\",\"acquired_ns\":{},\"released_ns\":{},\"read\":{},\"wrote\":{},\"write\":\"{}\",\"stalled\":{}}}",
+                o.process,
+                o.node + 1,
+                o.acquired,
+                o.released,
+                o.read,
+                o.read + 1,
+                outcome(o.wrote),
+                o.stalled
+            )
+        }));
+    }
+    if let Some((writes, _)) = &r.watch {
+        lines.extend(writes.iter().map(|w| {
+            format!(
+                "{{\"process\":{},\"node\":{},\"f\":\"watched-put\",\"key\":{},\"value\":{},\"start_ns\":{},\"end_ns\":{},\"type\":\"{}\",\"revision\":{}}}",
+                w.process,
+                w.node + 1,
+                w.key,
+                w.value,
+                w.start,
+                w.end,
+                outcome(w.outcome),
+                w.revision.map_or("null".into(), |r| r.to_string())
+            )
+        }));
+    }
     std::fs::write(r.dir.join("history.jsonl"), lines.join("\n") + "\n")
         .map_err(|e| e.to_string())?;
     let nemesis: Vec<String> = r
