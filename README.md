@@ -14,8 +14,8 @@ with an unknown outcome) and then checks the history for
 **linearizability**, the strongest single-object consistency guarantee.
 
 The target today is **etcd**, the consensus store behind Kubernetes: its
-key-value operations for linearizability, and its locks for mutual
-exclusion and lost updates.
+key-value operations for linearizability, its locks for mutual exclusion
+and lost updates, and its watch streams for order and completeness.
 
 ## Does it work? It catches stale reads, and passes correct ones
 
@@ -123,6 +123,43 @@ fence, not the lock, keeps the data safe. Faults on the etcd servers alone,
 with short critical sections, did not break the lock in 120 seconds; the
 hazard needs the holder itself to outlive its lease.
 
+## Watches: the stream Kubernetes is built on
+
+Every Kubernetes controller learns about changes through etcd watches.
+etcd promises that a watcher receives events in revision order, without
+duplicates, only for committed writes, with every watcher agreeing on what
+happened at each revision, and without missing any. `--workload watch`
+checks all of it: writers put unique values to a few keys while one watcher
+per node streams every change, reconnecting after crashes and resuming just
+after the last revision it saw, as real clients do. Each write creates
+exactly one revision, so after the faults heal a watcher that has caught up
+must have seen *every* revision from the first write to the last, exactly
+once: a missed event cannot hide.
+
+```
+$ sudo faultline test etcd --etcd ./etcd --workload watch --time 90 --faults partition,kill,pause --fault-gap 3 --fault-for 6 --seed 12
+  workload: watch, 53055 acknowledged writes, revisions up to 53092
+  3 watchers received 159273 events over 90 reconnections; 3 of 3 caught up
+  VALID: every watcher saw every revision once, in order, and all agreed
+```
+
+(Revisions exceed acknowledged writes by 37: writes that timed out during
+faults but committed anyway. Counting them is why the checker compares
+against revisions, not acknowledgements.)
+
+To prove the checker can fail, `--watch-resume N` plants the classic client
+bug: resuming from the last revision plus 0 (the last event is delivered
+twice) or plus 2 (one event is skipped). Both are caught:
+
+```
+$ sudo faultline test etcd --etcd ./etcd --workload watch --watch-resume 0 --time 30 --faults kill,partition
+  INVALID: 1 watch violations
+    watcher 0 (n1) saw revision 5904 after 5904: out of order or duplicated
+$ sudo faultline test etcd --etcd ./etcd --workload watch --watch-resume 2 --time 30 --faults kill,partition
+  INVALID: 1 watch violations
+    watcher 0 (n1) missed 1 revisions, first [7190]
+```
+
 ## How it works
 
 - **Nodes in network namespaces.** Each node gets a namespace, a veth pair
@@ -169,8 +206,8 @@ with no arguments lists them.
 
 - One database so far. Faults are partitions, crashes and pauses; clock
   skew, disk faults and membership changes are not yet modeled.
-- Workloads are a single-key register and a lease-based lock.
-  Multi-key transactions and watches are not yet checked.
+- Workloads are a single-key register, a lease-based lock and watches.
+  Multi-key transactions are not yet checked.
 - Every node shares one machine, so timing differs from a real
   multi-machine deployment; it finds ordering bugs, not performance ones.
 

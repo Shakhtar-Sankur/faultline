@@ -53,6 +53,18 @@ jobs:
         run: |
           sudo ./target/release/faultline test etcd --etcd etcd-$ETCD-linux-amd64/etcd \
             --workload lock --fenced --stall-percent 5 --time 40 --faults none | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: watches stay ordered and complete under faults
+        run: |
+          sudo ./target/release/faultline test etcd --etcd etcd-$ETCD-linux-amd64/etcd \
+            --workload watch --time 60 --faults partition,kill,pause --fault-gap 3 --fault-for 6 | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: a planted watch-resume bug must be caught
+        run: |
+          set +e
+          sudo ./target/release/faultline test etcd --etcd etcd-$ETCD-linux-amd64/etcd \
+            --workload watch --watch-resume 2 --time 30 --faults kill --fault-gap 3 --fault-for 5 > watch.txt
+          code=$?
+          cat watch.txt | tee -a "$GITHUB_STEP_SUMMARY"
+          if [ "$code" -ne 1 ]; then echo "expected missed revisions (exit 1), got $code" >&2; exit 1; fi
       - name: keep histories and logs, not databases
         if: always()
         run: |

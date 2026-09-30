@@ -41,6 +41,31 @@ pub trait LockClient: Send {
     fn revoke(&mut self, lease: &str) -> Result<(), Error>;
 }
 
+/// One event a watcher received.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WatchEvent {
+    pub key: u64,
+    pub value: u64,
+    pub revision: u64,
+}
+
+/// Writes that report their revision, and watches over the same keys.
+pub trait WatchClient: Send {
+    /// Write `value` to `key`; returns the revision the write created.
+    fn put(&mut self, key: u64, value: u64) -> Result<u64, Error>;
+    /// The store's current revision (a linearizable read).
+    fn revision(&mut self) -> Result<u64, Error>;
+    /// Stream events for the workload's keys from revision `from` into
+    /// `sink` until the stream breaks (`Err`) or `sink` returns false.
+    /// `idle` is called while no event arrives; returning false ends it.
+    fn watch(
+        &mut self,
+        from: u64,
+        sink: &mut dyn FnMut(WatchEvent) -> bool,
+        idle: &mut dyn FnMut() -> bool,
+    ) -> Result<(), Error>;
+}
+
 pub trait Database: Send + Sync {
     fn name(&self) -> String;
     /// Start `node`'s processes (also used to restart it after a crash).
@@ -59,6 +84,15 @@ pub trait Database: Send + Sync {
         _node: usize,
         _timeout: Duration,
     ) -> Option<Box<dyn LockClient>> {
+        None
+    }
+    /// A client for the watch workload, if the database offers watches.
+    fn watch_client(
+        &self,
+        _cluster: &Cluster,
+        _node: usize,
+        _timeout: Duration,
+    ) -> Option<Box<dyn WatchClient>> {
         None
     }
     /// The node that currently leads, if the database has one and some

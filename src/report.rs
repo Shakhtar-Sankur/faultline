@@ -50,7 +50,19 @@ pub fn summary(r: &Report, db: &dyn Database, cfg: &Config) -> String {
             );
         }
     }
-    let register_ops: &[(&str, IsKind)] = if r.locks.is_some() {
+    if let Some(w) = &r.watch {
+        let _ = writeln!(
+            out,
+            "\n  workload: watch, {} acknowledged writes, revisions up to {}",
+            w.writes_ok, w.final_revision
+        );
+        let _ = writeln!(
+            out,
+            "  {} watchers received {} events over {} reconnections; {} of {} caught up",
+            w.watchers, w.events, w.reconnects, w.caught_up, w.watchers
+        );
+    }
+    let register_ops: &[(&str, IsKind)] = if r.locks.is_some() || r.watch.is_some() {
         &[]
     } else {
         let _ = writeln!(
@@ -95,6 +107,32 @@ pub fn summary(r: &Report, db: &dyn Database, cfg: &Config) -> String {
         let _ = writeln!(out, "    {:>8.3}s  {what}", *t as f64 / 1e9);
     }
     let _ = writeln!(out);
+    if let Some(w) = &r.watch {
+        if w.valid() {
+            let _ = writeln!(
+                out,
+                "  VALID: every watcher saw every revision once, in order, and all agreed"
+            );
+        } else {
+            let _ = writeln!(out, "  INVALID: {} watch violations", w.violations.len());
+            if w.caught_up < w.watchers {
+                let _ = writeln!(
+                    out,
+                    "    {} watchers never caught up to the final revision",
+                    w.watchers - w.caught_up
+                );
+            }
+            for v in w.violations.iter().take(8) {
+                let _ = writeln!(out, "    {v}");
+            }
+        }
+        let _ = writeln!(
+            out,
+            "\n  history, nemesis log and node logs: {}",
+            r.dir.display()
+        );
+        return out;
+    }
     if let Some((_, l)) = &r.locks {
         if l.valid() {
             let _ = writeln!(

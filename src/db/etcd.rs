@@ -2,11 +2,12 @@
 //! requests, writes are puts, and compare-and-set is a transaction that
 //! compares the value and puts on success.
 
-use std::net::SocketAddr;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream};
 use std::path::PathBuf;
 use std::time::Duration;
 
-use super::{Client, Database, Error, LockClient};
+use super::{Client, Database, Error, LockClient, WatchClient, WatchEvent};
 use crate::cluster::Cluster;
 use crate::history::Call;
 use crate::http::{self, HttpError};
@@ -117,6 +118,19 @@ impl Database for Etcd {
         node: usize,
         timeout: Duration,
     ) -> Option<Box<dyn LockClient>> {
+        Some(Box::new(EtcdClient {
+            addr: SocketAddr::new(cluster.nodes[node].ip.into(), CLIENT_PORT),
+            timeout,
+            serializable_reads: false,
+        }))
+    }
+
+    fn watch_client(
+        &self,
+        cluster: &Cluster,
+        node: usize,
+        timeout: Duration,
+    ) -> Option<Box<dyn WatchClient>> {
         Some(Box::new(EtcdClient {
             addr: SocketAddr::new(cluster.nodes[node].ip.into(), CLIENT_PORT),
             timeout,
@@ -325,5 +339,149 @@ impl LockClient for EtcdClient {
     fn revoke(&mut self, lease: &str) -> Result<(), Error> {
         self.request("/v3/lease/revoke", &format!(r#"{{"ID":"{lease}"}}"#), false)
             .map(|_| ())
+    }
+}
+
+/// Watched keys are `w/<n>`; the range `w/`..`w0` covers them all.
+fn watch_key(key: u64) -> String {
+    json::base64(format!("w/{key}").as_bytes())
+}
+
+fn num_field(j: &Json, key: &str) -> Option<u64> {
+    j.get(key)
+        .and_then(Json::as_str)
+        .and_then(|s| s.parse().ok())
+}
+
+impl WatchClient for EtcdClient {
+    fn put(&mut self, key: u64, value: u64) -> Result<u64, Error> {
+        let body = format!(
+            r#"{{"key":"{}","value":"{}"}}"#,
+            watch_key(key),
+            val_b64(value)
+        );
+        let r = self.request("/v3/kv/put", &body, false)?;
+        r.get("header")
+            .and_then(|h| num_field(h, "revision"))
+            .ok_or_else(|| Error::Unknown("put: no revision".into()))
+    }
+
+    fn revision(&mut self) -> Result<u64, Error> {
+        let r = self.request("/v3/kv/range", r#"{"key":"AA==","count_only":true}"#, true)?;
+        r.get("header")
+            .and_then(|h| num_field(h, "revision"))
+            .ok_or_else(|| Error::Fail("range: no revision".into()))
+    }
+
+    fn watch(
+        &mut self,
+        from: u64,
+        sink: &mut dyn FnMut(WatchEvent) -> bool,
+        idle: &mut dyn FnMut() -> bool,
+    ) -> Result<(), Error> {
+        let fail = |e: std::io::Error| Error::Fail(e.to_string());
+        let mut s = TcpStream::connect_timeout(&self.addr, self.timeout).map_err(fail)?;
+        s.set_read_timeout(Some(Duration::from_millis(200)))
+            .map_err(fail)?;
+        let body = format!(
+            r#"{{"create_request":{{"key":"{}","range_end":"{}","start_revision":"{from}"}}}}"#,
+            json::base64(b"w/"),
+            json::base64(b"w0")
+        );
+        let req = format!(
+            "POST /v3/watch HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+            self.addr,
+            body.len()
+        );
+        s.write_all(req.as_bytes()).map_err(fail)?;
+        // The response is chunked (framing in `raw`); the de-chunked body
+        // holds one JSON message per line.
+        let mut raw: Vec<u8> = Vec::new();
+        let mut body: Vec<u8> = Vec::new();
+        let mut headers_done = false;
+        let mut chunk = [0u8; 16384];
+        loop {
+            match s.read(&mut chunk) {
+                Ok(0) => return Err(Error::Fail("watch stream closed".into())),
+                Ok(n) => raw.extend_from_slice(&chunk[..n]),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if !idle() {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                Err(e) => return Err(fail(e)),
+            }
+            if !headers_done {
+                let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let status = String::from_utf8_lossy(&raw[..end]).into_owned();
+                if !status.starts_with("HTTP/1.1 200") {
+                    let first = status.lines().next().unwrap_or("").to_string();
+                    return Err(Error::Fail(format!("watch: {first}")));
+                }
+                raw.drain(..end + 4);
+                headers_done = true;
+            }
+            // Move every complete chunk's payload into the body.
+            while let Some(eol) = raw.windows(2).position(|w| w == b"\r\n") {
+                let size = std::str::from_utf8(&raw[..eol])
+                    .ok()
+                    .and_then(|h| usize::from_str_radix(h.trim(), 16).ok())
+                    .ok_or_else(|| Error::Fail("watch: bad chunk framing".into()))?;
+                if size == 0 {
+                    return Err(Error::Fail("watch stream ended".into()));
+                }
+                if raw.len() < eol + 2 + size + 2 {
+                    break;
+                }
+                body.extend_from_slice(&raw[eol + 2..eol + 2 + size]);
+                raw.drain(..eol + 2 + size + 2);
+            }
+            while let Some(nl) = body.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = body.drain(..=nl).collect();
+                let text = String::from_utf8_lossy(&line);
+                let text = text.trim();
+                if text.is_empty() {
+                    continue;
+                }
+                let Ok(msg) = json::parse(text) else { continue };
+                let Some(result) = msg.get("result") else {
+                    return Err(Error::Fail(format!("watch error: {text}")));
+                };
+                if result.get("canceled").and_then(Json::as_bool) == Some(true) {
+                    return Err(Error::Fail(format!("watch canceled: {text}")));
+                }
+                for ev in result.get("events").map(Json::as_arr).unwrap_or(&[]) {
+                    let Some(kv) = ev.get("kv") else { continue };
+                    let key = str_field(kv, "key")
+                        .and_then(json::unbase64)
+                        .and_then(|b| String::from_utf8(b).ok())
+                        .and_then(|k| k.strip_prefix("w/").and_then(|n| n.parse().ok()));
+                    let value = str_field(kv, "value")
+                        .and_then(json::unbase64)
+                        .and_then(|b| String::from_utf8(b).ok())
+                        .and_then(|v| v.parse().ok());
+                    let (Some(key), Some(value), Some(revision)) =
+                        (key, value, num_field(kv, "mod_revision"))
+                    else {
+                        continue;
+                    };
+                    if !sink(WatchEvent {
+                        key,
+                        value,
+                        revision,
+                    }) {
+                        return Ok(());
+                    }
+                }
+            }
+        }
     }
 }

@@ -3,3 +3,4 @@
 pub mod linearizable;
 pub mod lock;
 pub mod set;
+pub mod watch;

@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::checker::linearizable::{self, Violation};
 use crate::checker::lock::{self as lockcheck, LockOp, LockReport};
+use crate::checker::watch::{self as watchcheck, WatchReport, WatchWrite, Watcher};
 use crate::cluster::Cluster;
 use crate::db::{self, Database, Error};
 use crate::history::{Call, Op, Outcome};
@@ -36,6 +37,9 @@ pub enum Workload {
     /// conditional on still owning the lock; `stall_percent` of critical
     /// sections stall past the lease, as a long GC pause would.
     Lock { fenced: bool, stall_percent: u64 },
+    /// Writers put unique values while one watcher per node streams every
+    /// change; checked for order, agreement, phantoms and gaps.
+    Watch,
 }
 
 /// Which node a fault picks.
@@ -69,6 +73,10 @@ pub struct Config {
     pub fault_for: Duration,
     pub target: Target,
     pub workload: Workload,
+    /// Watchers resume after a disconnect from the last revision seen plus
+    /// this. 1 is correct; 0 (duplicates) and 2 (gaps) are planted client
+    /// bugs, to prove the watch checker catches them.
+    pub watch_resume: u64,
     /// Operations on one key before clients move to the next, which keeps
     /// each key's history small enough to check exhaustively.
     pub ops_per_key: u64,
@@ -91,6 +99,7 @@ pub struct Report {
     pub undecided: Vec<u64>,
     /// The lock workload's operations and verdict.
     pub locks: Option<(Vec<LockOp>, LockReport)>,
+    pub watch: Option<WatchReport>,
     pub dir: PathBuf,
 }
 
@@ -98,6 +107,9 @@ impl Report {
     pub fn valid(&self) -> Option<bool> {
         if let Some((_, l)) = &self.locks {
             return Some(l.valid());
+        }
+        if let Some(w) = &self.watch {
+            return Some(w.valid());
         }
         if !self.violations.is_empty() {
             Some(false)
@@ -154,8 +166,45 @@ pub fn run(db: &dyn Database, cfg: &Config) -> Result<Report, String> {
     let nemesis_log: Mutex<Vec<(u64, String)>> = Mutex::new(Vec::new());
     let next_op = AtomicU64::new(0);
     let lock_ops: Mutex<Vec<LockOp>> = Mutex::new(Vec::new());
+    let watch_writes: Mutex<Vec<WatchWrite>> = Mutex::new(Vec::new());
+    let watchers: Mutex<Vec<Watcher>> = Mutex::new(Vec::new());
+    // The revision watchers must reach before they stop (0: not known
+    // yet), and whether to give up on that.
+    let watch_target = AtomicU64::new(0);
+    let abort = AtomicBool::new(false);
+    let first_revision = match cfg.workload {
+        Workload::Watch => current_revision(db, &cluster, cfg)?,
+        _ => 0,
+    };
 
-    std::thread::scope(|s| {
+    std::thread::scope(|s| -> Result<(), String> {
+        let mut workers = Vec::new();
+        if cfg.workload == Workload::Watch {
+            let next_value = &next_op;
+            for p in 0..cfg.clients {
+                let (cluster, out) = (&cluster, &watch_writes);
+                workers.push(
+                    s.spawn(move || watch_writer(db, cluster, cfg, p, deadline, next_value, out)),
+                );
+            }
+            for node in 0..cfg.nodes {
+                let (cluster, out) = (&cluster, &watchers);
+                let (target, abort) = (&watch_target, &abort);
+                s.spawn(move || {
+                    let w = watcher(
+                        db,
+                        cluster,
+                        cfg,
+                        node,
+                        first_revision,
+                        deadline,
+                        target,
+                        abort,
+                    );
+                    out.lock().unwrap().push(w);
+                });
+            }
+        }
         if let Workload::Lock {
             fenced,
             stall_percent,
@@ -163,7 +212,7 @@ pub fn run(db: &dyn Database, cfg: &Config) -> Result<Report, String> {
         {
             for p in 0..cfg.clients {
                 let (cluster, out) = (&cluster, &lock_ops);
-                s.spawn(move || {
+                workers.push(s.spawn(move || {
                     lock_client(
                         db,
                         cluster,
@@ -175,12 +224,12 @@ pub fn run(db: &dyn Database, cfg: &Config) -> Result<Report, String> {
                         stall_percent,
                         out,
                     )
-                });
+                }));
             }
         }
         for p in (0..cfg.clients).filter(|_| cfg.workload == Workload::Register) {
             let (history, next_op, cluster) = (&history, &next_op, &cluster);
-            s.spawn(move || {
+            workers.push(s.spawn(move || {
                 let node = p % cfg.nodes;
                 let mut client = db.client(cluster, node, cfg.timeout);
                 let mut rng = Rng::new(cfg.seed ^ ((p as u64 + 1) * 0x5851_F42D));
@@ -213,23 +262,37 @@ pub fn run(db: &dyn Database, cfg: &Config) -> Result<Report, String> {
                     }
                     std::thread::sleep(cfg.op_delay);
                 }
-            });
+            }));
         }
 
         if !cfg.faults.is_empty() {
             let (cluster, log) = (&cluster, &nemesis_log);
-            s.spawn(move || nemesis(db, cluster, cfg, deadline, t0, log));
+            workers.push(s.spawn(move || nemesis(db, cluster, cfg, deadline, t0, log)));
         }
-    });
+        for w in workers {
+            let _ = w.join();
+        }
 
-    // Heal whatever is left and let the cluster settle before tearing down.
-    cluster.heal()?;
-    for i in 0..cluster.nodes.len() {
-        let _ = cluster.resume(i);
-        if !cluster.is_running(i) {
-            db.start(&cluster, i)?;
+        // Heal whatever is left, so the cluster can settle (and watchers
+        // catch up) before it is torn down.
+        let healed = (|| {
+            cluster.heal()?;
+            for i in 0..cluster.nodes.len() {
+                let _ = cluster.resume(i);
+                if !cluster.is_running(i) {
+                    db.start(&cluster, i)?;
+                }
+            }
+            if cfg.workload == Workload::Watch {
+                watch_target.store(current_revision(db, &cluster, cfg)?, Ordering::SeqCst);
+            }
+            Ok(())
+        })();
+        if healed.is_err() {
+            abort.store(true, Ordering::SeqCst);
         }
-    }
+        healed
+    })?;
 
     let mut history = history.into_inner().unwrap();
     history.sort_by_key(|o| (o.start, o.process));
@@ -253,9 +316,20 @@ pub fn run(db: &dyn Database, cfg: &Config) -> Result<Report, String> {
             let r = lockcheck::check(&ops);
             Some((ops, r))
         }
-        Workload::Register => None,
+        Workload::Register | Workload::Watch => None,
     };
+    let watch = (cfg.workload == Workload::Watch).then(|| {
+        let mut ws = watchers.into_inner().unwrap();
+        ws.sort_by_key(|w| w.node);
+        watchcheck::check(
+            &watch_writes.into_inner().unwrap(),
+            &ws,
+            first_revision,
+            watch_target.load(Ordering::SeqCst),
+        )
+    });
     let report = Report {
+        watch,
         keys: by_key.len(),
         history,
         nemesis: nemesis_log.into_inner().unwrap(),
@@ -436,4 +510,108 @@ fn lock_client(
         let _ = c.revoke(&lease);
         std::thread::sleep(cfg.op_delay);
     }
+}
+
+/// The store's revision, from whichever node answers first (retrying for
+/// up to half a minute while the cluster recovers).
+fn current_revision(db: &dyn Database, cluster: &Cluster, cfg: &Config) -> Result<u64, String> {
+    let until = Instant::now() + Duration::from_secs(30);
+    loop {
+        for node in 0..cfg.nodes {
+            if let Some(mut c) = db.watch_client(cluster, node, cfg.timeout)
+                && let Ok(r) = c.revision()
+            {
+                return Ok(r);
+            }
+        }
+        if Instant::now() > until {
+            return Err("no node would report the current revision".into());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// A watch-workload writer: unique values to a handful of keys.
+fn watch_writer(
+    db: &dyn Database,
+    cluster: &Cluster,
+    cfg: &Config,
+    p: usize,
+    deadline: Instant,
+    next_value: &AtomicU64,
+    out: &Mutex<Vec<WatchWrite>>,
+) {
+    let Some(mut c) = db.watch_client(cluster, p % cfg.nodes, cfg.timeout) else {
+        return;
+    };
+    let mut rng = Rng::new(cfg.seed ^ ((p as u64 + 3) * 0x9E37_79B9));
+    while Instant::now() < deadline {
+        let (key, value) = (rng.below(5), next_value.fetch_add(1, Ordering::Relaxed));
+        let (outcome, revision) = match c.put(key, value) {
+            Ok(rev) => (Outcome::Ok, Some(rev)),
+            Err(Error::Fail(_)) => (Outcome::Fail, None),
+            Err(Error::Unknown(_)) => (Outcome::Info, None),
+        };
+        out.lock().unwrap().push(WatchWrite {
+            process: p,
+            key,
+            value,
+            outcome,
+            revision,
+        });
+        std::thread::sleep(cfg.op_delay);
+    }
+}
+
+/// A watcher on one node: stream from just after the last revision seen,
+/// reconnecting whenever the stream breaks, until it has seen `target`
+/// (once known) or catching up takes a minute past the deadline.
+#[allow(clippy::too_many_arguments)]
+fn watcher(
+    db: &dyn Database,
+    cluster: &Cluster,
+    cfg: &Config,
+    node: usize,
+    first_revision: u64,
+    deadline: Instant,
+    target: &AtomicU64,
+    abort: &AtomicBool,
+) -> Watcher {
+    let mut w = Watcher {
+        node,
+        ..Watcher::default()
+    };
+    let Some(mut c) = db.watch_client(cluster, node, cfg.timeout) else {
+        return w;
+    };
+    let last = std::cell::Cell::new(first_revision);
+    let give_up = deadline + Duration::from_secs(60);
+    let done = |last: u64| {
+        let t = target.load(Ordering::SeqCst);
+        (t != 0 && last >= t) || abort.load(Ordering::SeqCst) || Instant::now() > give_up
+    };
+    while !done(last.get()) {
+        // The first connection starts right after the initial revision;
+        // resumptions after a break use the configured offset.
+        let from = if w.reconnects == 0 && w.events.is_empty() {
+            last.get() + 1
+        } else {
+            last.get() + cfg.watch_resume
+        };
+        let events = &mut w.events;
+        let r = c.watch(
+            from,
+            &mut |e| {
+                last.set(last.get().max(e.revision));
+                events.push(e);
+                !done(last.get())
+            },
+            &mut || !done(last.get()),
+        );
+        if r.is_err() {
+            w.reconnects += 1;
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+    w
 }

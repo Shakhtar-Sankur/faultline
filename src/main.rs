@@ -23,10 +23,13 @@ options:
   --seed N              seed for the operation and fault schedule (default: time)
   --store DIR           where results go (default ./store)
   --serializable-reads  etcd: read without consulting a quorum (may be stale)
-  --workload W          register (linearizability) or lock (mutual exclusion
-                        and lost updates) (default register)
+  --workload W          register (linearizability), lock (mutual exclusion and
+                        lost updates) or watch (ordered, complete watch
+                        streams) (default register)
   --fenced              lock: write only while still owning the lock
   --stall-percent N     lock: stall N% of lock holders past their lease (default 0)
+  --watch-resume N      watch: resume from last revision + N after a disconnect;
+                        1 is correct, 0 and 2 are planted client bugs (default 1)
 
 Needs root: nodes run in network namespaces, faults use iptables.
 Exit status: 0 valid, 1 invalid, 2 undecided, 3 error.";
@@ -68,6 +71,7 @@ fn run_etcd(args: &[String]) -> Result<ExitCode, String> {
         fault_for: Duration::from_secs(5),
         target: Target::Random,
         workload: Workload::Register,
+        watch_resume: 1,
         ops_per_key: 150,
         timeout: Duration::from_millis(1000),
         op_delay: Duration::from_millis(10),
@@ -107,13 +111,13 @@ fn run_etcd(args: &[String]) -> Result<ExitCode, String> {
             "--timeout-ms" => cfg.timeout = Duration::from_millis(num()?),
             "--seed" => cfg.seed = num()?,
             "--stall-percent" => stall_percent = num()?.min(100),
-            "--workload" => {
-                lock = match value.as_str() {
-                    "register" => false,
-                    "lock" => true,
-                    other => return Err(format!("unknown workload {other}")),
-                }
-            }
+            "--watch-resume" => cfg.watch_resume = num()?,
+            "--workload" => match value.as_str() {
+                "register" => lock = false,
+                "lock" => lock = true,
+                "watch" => cfg.workload = Workload::Watch,
+                other => return Err(format!("unknown workload {other}")),
+            },
             "--target" => {
                 cfg.target = match value.as_str() {
                     "random" => Target::Random,
